@@ -1,0 +1,11 @@
+{
+  "bot_token": "your_telegram_bot_token",
+  "chat_id": "your_chat_id",
+  "thresholds": {
+    "cpu_load": 90.0,
+    "temperature": 80.0,
+    "power": 10.0,
+    "ram_usage": 85.0,
+    "disk_usage": 90.0
+  }
+}
