@@ -6,10 +6,10 @@ import psutil
 import requests
 
 # Define paths and directories
-BASE_DIR = os.path.expanduser("~/power_est")
-LOG_FILE_TEXT = os.path.join(BASE_DIR, "power_log.txt")
-LOG_FILE_CSV = os.path.join(BASE_DIR, "power_log.csv")
-ARCHIVE_DIR = os.path.join(BASE_DIR, "log_archive")
+BASE_DIR = os.path.expanduser("~/sys_monitoring")
+LOG_FILE_TEXT = os.path.join(BASE_DIR, "logs", "power_log.txt")
+LOG_FILE_CSV = os.path.join(BASE_DIR, "logs", "power_log.csv")
+ARCHIVE_DIR = os.path.join(BASE_DIR, "logs", "log_archive")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 
 # Load configuration from config.json

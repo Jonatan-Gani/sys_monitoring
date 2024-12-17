@@ -45,5 +45,3 @@ Logs
         Automatically stored in log_archive/year/month.
 
 License
-
-This project is licensed under the MIT License. See LICENSE for more details.

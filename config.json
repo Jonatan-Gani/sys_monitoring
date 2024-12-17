@@ -1,6 +1,6 @@
 {
-  "bot_token": "your_telegram_bot_token",
-  "chat_id": "your_chat_id",
+  "bot_token": "7984273267:AAHDAS3u2gOt_HsgHHFseIeqdNn0KBz7tEc",
+  "chat_id": "1556597831",
   "thresholds": {
     "cpu_load": 90.0,
     "temperature": 80.0,

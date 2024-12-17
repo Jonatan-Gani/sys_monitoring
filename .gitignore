@@ -1,0 +1,16 @@
+# Ignore config.json
+config.json
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore log files
+*.log
+log_archive/
+power_log.txt
+power_log.csv
+
+# Ignore system files
+.DS_Store
+.env
