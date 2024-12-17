@@ -5,22 +5,52 @@ import csv
 import psutil
 import requests
 
+
+
+
 # Define paths and directories
 BASE_DIR = os.path.expanduser("~/sys_monitoring")
 LOG_FILE_TEXT = os.path.join(BASE_DIR, "logs", "power_log.txt")
 LOG_FILE_CSV = os.path.join(BASE_DIR, "logs", "power_log.csv")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "logs", "log_archive")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+ENV_FILE = os.path.join(os.path.dirname(__file__), ".env")
 
-# Load configuration from config.json
+# Manually load environment variables from .env
+def load_env(env_file):
+    env_vars = {}
+    try:
+        with open(env_file, "r") as f:
+            for line in f:
+                if line.strip() and not line.startswith("#"):
+                    key, value = line.strip().split("=", 1)
+                    env_vars[key] = value
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Environment file {env_file} not found!")
+    return env_vars
+
+# Load configuration
 try:
+    # Load thresholds from config.json
     with open(CONFIG_FILE, "r") as f:
         config = json.load(f)
-        TELEGRAM_BOT_TOKEN = config["bot_token"]
-        TELEGRAM_CHAT_ID = config["chat_id"]
         THRESHOLDS = config["thresholds"]
-except (FileNotFoundError, KeyError) as e:
+
+    # Load sensitive data from .env file
+    env_vars = load_env(ENV_FILE)
+    TELEGRAM_BOT_TOKEN = env_vars.get("BOT_TOKEN")
+    TELEGRAM_CHAT_ID = env_vars.get("CHAT_ID")
+
+    # Validate that required environment variables are present
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise ValueError("BOT_TOKEN or CHAT_ID not found in .env file!")
+
+except (FileNotFoundError, KeyError, ValueError) as e:
     raise ValueError(f"Configuration error: {e}")
+
+
+
+
 
 def send_telegram_alert(message):
     """Send a Telegram message via the bot."""

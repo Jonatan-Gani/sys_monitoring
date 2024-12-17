@@ -1,6 +1,6 @@
 {
-  "bot_token": "7984273267:AAHDAS3u2gOt_HsgHHFseIeqdNn0KBz7tEc",
-  "chat_id": "1556597831",
+  "bot_token": "${BOT_TOKEN}",
+  "chat_id": "${CHAT_ID}",
   "thresholds": {
     "cpu_load": 90.0,
     "temperature": 80.0,
@@ -9,3 +9,4 @@
     "disk_usage": 90.0
   }
 }
+
