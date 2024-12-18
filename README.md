@@ -139,7 +139,7 @@ The script sends alerts to the specified Telegram chat when thresholds are excee
 1. Open Telegram and search for "BotFather".
 2. Start a chat with BotFather and type `/newbot`.
 3. Follow the instructions to set a name and username for your bot.
-4. After creation, you will receive the bot token. Save it for later use.
+4. After creation, you will receive the bot token. KEEP BOT TOKEN PRIVATE AND NEVER SHARE IT!
 
 ### **2. Get Your Chat ID**
 
