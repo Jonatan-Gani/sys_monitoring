@@ -27,55 +27,66 @@ This script monitors system metrics such as CPU load, temperature, RAM usage, di
 
 ## **Installation**
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/YOUR_GITHUB_USERNAME/sys_monitoring.git
-   cd sys_monitoring
-   ```
+### **1. Clone the Repository**
 
-2. **Install Dependencies**:
-   This script uses `psutil` and `requests`:
-   ```bash
-   sudo apt update
-   sudo apt install python3-psutil python3-requests
-   ```
+```bash
+git clone https://github.com/Jonatan-Gani/sys_monitoring.git
+cd sys_monitoring
+```
 
-3. **Create a `.env` File**:
-   Add your Telegram Bot Token and Chat ID to a `.env` file:
-   ```bash
-   nano .env
-   ```
-   Add the following content:
-   ```
-   BOT_TOKEN=your_telegram_bot_token
-   CHAT_ID=your_telegram_chat_id
-   ```
+### **2. Install Dependencies**
 
-4. **Configure Thresholds**:
-   Edit the `config.json` file to set threshold values:
-   ```json
-   {
-     "bot_token": "${BOT_TOKEN}",
-     "chat_id": "${CHAT_ID}",
-     "thresholds": {
-       "cpu_load": 90.0,
-       "temperature": 70.0,
-       "power": 10.0,
-       "ram_usage": 85.0,
-       "disk_usage": 90.0
-     }
-   }
-   ```
+This script uses `psutil` and `requests`:
 
-5. **Schedule the Script**:
-   Use `cron` to run the script every minute:
-   ```bash
-   crontab -e
-   ```
-   Add the following line:
-   ```
-   * * * * * /usr/bin/python3 /path/to/log_pi_status.py
-   ```
+```bash
+sudo apt update
+sudo apt install python3-psutil python3-requests
+```
+
+### **3. Create a `.env` File**
+
+Add your Telegram Bot Token and Chat ID to a `.env` file:
+
+```bash
+nano .env
+```
+Add the following content:
+
+```
+BOT_TOKEN=your_telegram_bot_token
+CHAT_ID=your_telegram_chat_id
+```
+
+### **4. Configure Thresholds**
+
+Edit the `config.json` file to set threshold values:
+
+```json
+{
+  "bot_token": "${BOT_TOKEN}",
+  "chat_id": "${CHAT_ID}",
+  "thresholds": {
+    "cpu_load": 90.0,
+    "temperature": 70.0,
+    "power": 10.0,
+    "ram_usage": 85.0,
+    "disk_usage": 90.0
+  }
+}
+```
+
+### **5. Schedule the Script**
+
+Use `cron` to run the script every minute:
+
+```bash
+crontab -e
+```
+Add the following line:
+
+```
+* * * * * /usr/bin/python3 /path/to/log_pi_status.py
+```
 
 ---
 
@@ -91,6 +102,7 @@ This script monitors system metrics such as CPU load, temperature, RAM usage, di
 ## **Usage**
 
 Run the script manually:
+
 ```bash
 python3 log_pi_status.py
 ```
@@ -112,10 +124,32 @@ Timestamp,CPU Load (%),Temperature (°C),RAM Usage (%),Disk Usage (%),Network Se
 ## **Alerts**
 
 The script sends alerts to the specified Telegram chat when thresholds are exceeded:
+
 - **High CPU Load**: ⚠️ High CPU Load: 90.0%
 - **High Temperature**: 🔥 High Temperature: 70.0°C
 - **High Power Consumption**: ⚡ High Power Consumption: 10.0 W
 - **High RAM or Disk Usage**: ⚠️ High RAM Usage: 85.0%
+
+---
+
+## **How to Get Telegram Bot Token and Chat ID**
+
+### **1. Create a Telegram Bot**
+
+1. Open Telegram and search for "BotFather".
+2. Start a chat with BotFather and type `/newbot`.
+3. Follow the instructions to set a name and username for your bot.
+4. After creation, you will receive the bot token. Save it for later use.
+
+### **2. Get Your Chat ID**
+
+1. Start a chat with your newly created bot.
+2. Open a browser and go to the following URL, replacing `<BOT_TOKEN>` with your bot's token:
+   ```
+   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
+   ```
+3. Send a message to your bot (e.g., "Hello").
+4. Refresh the URL, and look for the `chat` field in the response JSON. Note down the `id` as your `CHAT_ID`.
 
 ---
 
@@ -131,6 +165,8 @@ sys_monitoring/
 │   ├── power_log.csv        # Current CSV log
 │   └── log_archive/         # Archived logs
 │       ├── YYYY/
-│       │   ├── Mon_MM/
-│       │   │   ├── 17_Tuesday.csv
-└── README.md                # This file
+│       │   └── Mon_MM/
+│       │       └── 17_Tuesday.csv
+└── README.md                # Project README file
+```
+
