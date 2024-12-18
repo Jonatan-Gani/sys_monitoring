@@ -112,10 +112,10 @@ Timestamp,CPU Load (%),Temperature (°C),RAM Usage (%),Disk Usage (%),Network Se
 ## **Alerts**
 
 The script sends alerts to the specified Telegram chat when thresholds are exceeded:
-- **High CPU Load**: ⚠️ High CPU Load: 95.50%
-- **High Temperature**: 🔥 High Temperature: 72.0°C
-- **High Power Consumption**: ⚡ High Power Consumption: 15.0 W
-- **High RAM or Disk Usage**: ⚠️ High RAM Usage: 87.0%
+- **High CPU Load**: ⚠️ High CPU Load: 90.0%
+- **High Temperature**: 🔥 High Temperature: 70.0°C
+- **High Power Consumption**: ⚡ High Power Consumption: 10.0 W
+- **High RAM or Disk Usage**: ⚠️ High RAM Usage: 85.0%
 
 ---
 
