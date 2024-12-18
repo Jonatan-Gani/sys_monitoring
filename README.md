@@ -134,9 +134,3 @@ sys_monitoring/
 │       │   ├── Mon_MM/
 │       │   │   ├── 17_Tuesday.csv
 └── README.md                # This file
-
-If you’d like to improve the script, submit a pull request or open an issue. Suggestions and bug reports are always welcome!
-
----
-
-Let me know if you need further refinements! 🚀
