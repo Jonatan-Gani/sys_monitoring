@@ -1,7 +1,3 @@
-Here’s a clean **README.md** content that you can easily copy and paste.
-
----
-
 # **System Monitoring Script**
 
 This script monitors system metrics such as CPU load, temperature, RAM usage, disk usage, network activity, and estimates power consumption for a Linux-based system (e.g., Raspberry Pi). It logs the data in a CSV file, archives logs daily, and sends Telegram alerts when thresholds are exceeded.
@@ -138,17 +134,6 @@ sys_monitoring/
 │       │   ├── Mon_MM/
 │       │   │   ├── 17_Tuesday.csv
 └── README.md                # This file
-```
-
----
-
-## **License**
-
-This project is licensed under the MIT License. Feel free to use and modify it for your own purposes.
-
----
-
-### **Contributing**
 
 If you’d like to improve the script, submit a pull request or open an issue. Suggestions and bug reports are always welcome!
 
