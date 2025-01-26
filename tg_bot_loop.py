@@ -64,8 +64,8 @@ def get_available_days(year, month):
         if file_name.endswith(".csv"):
             day, weekday = file_name.split("_")
             day_number = day.zfill(2)  # Ensure zero-padded day
-            days.append(f"{weekday.split('.')[0]}\t{day_number}")  # Use tabs for alignment
-    return sorted(days, key=lambda x: int(x.split("\t\t")[1]))  # Split by tab
+            days.append(f"{weekday.split('.')[0]}\t\t{day_number}")  # Use tabs for alignment
+    return sorted(days, key=lambda x: int(x.split("\t")[1]))  # Split by tab
 
 
 def user_is_authorized(user_id):
