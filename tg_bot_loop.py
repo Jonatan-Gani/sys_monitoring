@@ -2,6 +2,9 @@ import os
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import json
+import signal
+import sys
 import time
 
 # Load environment variables
@@ -13,6 +16,26 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 LOGS_DIRECTORY = "logs/log_archive"
 LATEST_LOG_FILE = "logs/power_log.csv"
 
+# Load configuration
+def load_config():
+    with open("config.json", "r") as config_file:
+        return json.load(config_file)
+
+CONFIG = load_config()
+DEBUG_MODE = CONFIG.get("debug", False)
+
+# Debug function
+def debug_log(message):
+    if DEBUG_MODE:
+        print(message)
+
+# Graceful termination
+def signal_handler(sig, frame):
+    print("\nExiting bot...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
 # Helper functions
 def get_available_years():
     if not os.path.exists(LOGS_DIRECTORY):
@@ -23,7 +46,7 @@ def get_available_months(year):
     year_path = os.path.join(LOGS_DIRECTORY, year)
     if not os.path.exists(year_path):
         return []
-    return sorted([d for d in os.listdir(year_path) if d.startswith("Mon_")])
+    return sorted([d for d in os.listdir(year_path) if os.path.isdir(os.path.join(year_path, d))])
 
 def get_available_days(year, month):
     month_path = os.path.join(LOGS_DIRECTORY, year, month)
@@ -35,19 +58,23 @@ def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
 def send_message(chat_id, text):
+    debug_log(f"Sending message to {chat_id}: {text}")
     requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 def send_document(chat_id, file_path):
+    debug_log(f"Sending document to {chat_id}: {file_path}")
     with open(file_path, "rb") as file:
         requests.post(f"{TELEGRAM_API_URL}/sendDocument", files={"document": file}, data={"chat_id": chat_id})
 
 def reset_session(chat_id, user_sessions):
+    debug_log(f"Resetting session for {chat_id}")
     user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
     years = get_available_years()
     send_message(chat_id, f"Session reset due to inactivity. Available years: {', '.join(years)}\nEnter the year:")
 
 def handle_user_input(chat_id, user_id, text, user_sessions):
     if not user_is_authorized(user_id):
+        debug_log(f"Unauthorized access attempt by user {user_id}")
         send_message(chat_id, "Unauthorized user.")
         return
 
@@ -65,7 +92,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
         elif stage == "day":
             user_data["stage"] = "month"
             months = get_available_months(user_data.get("year"))
-            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12):")
+            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month:")
         return
 
     if stage == "year":
@@ -74,7 +101,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["year"] = text
             user_data["stage"] = "month"
             months = get_available_months(text)
-            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12). Type 'back' to go back:")
+            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month. Type 'back' to go back:")
         else:
             send_message(chat_id, f"Invalid year. Available years: {', '.join(years)}")
 
@@ -107,28 +134,36 @@ def poll_updates():
     user_sessions = {}
 
     while True:
-        response = requests.get(f"{TELEGRAM_API_URL}/getUpdates", params={"offset": offset, "timeout": 30}).json()
+        try:
+            response = requests.get(f"{TELEGRAM_API_URL}/getUpdates", params={"offset": offset, "timeout": 30}).json()
 
-        for update in response.get("result", []):
-            offset = update["update_id"] + 1
-            chat_id = update["message"]["chat"]["id"]
-            user_id = update["message"]["from"]["id"]
-            text = update["message"].get("text", "")
+            for update in response.get("result", []):
+                offset = update["update_id"] + 1
+                chat_id = update["message"]["chat"]["id"]
+                user_id = update["message"]["from"]["id"]
+                text = update["message"].get("text", "")
 
-            # Reset session after 20 seconds of inactivity
-            if chat_id in user_sessions:
-                last_active = user_sessions[chat_id].get("last_active")
-                if last_active and datetime.now() - last_active > timedelta(seconds=20):
+                debug_log(f"Received message from {user_id}: {text}")
+
+                # Reset session after 20 seconds of inactivity
+                if chat_id in user_sessions:
+                    last_active = user_sessions[chat_id].get("last_active")
+                    if last_active and datetime.now() - last_active > timedelta(seconds=20):
+                        reset_session(chat_id, user_sessions)
+                        continue
+
+                if chat_id not in user_sessions:
+                    user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
+
+                if text.lower() == "/getlog":
                     reset_session(chat_id, user_sessions)
-                    continue
-
-            if chat_id not in user_sessions:
-                user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
-
-            if text.lower() == "/getlog":
-                reset_session(chat_id, user_sessions)
-            else:
-                handle_user_input(chat_id, user_id, text, user_sessions)
+                else:
+                    handle_user_input(chat_id, user_id, text, user_sessions)
+        except KeyboardInterrupt:
+            print("\nGracefully shutting down...")
+            break
+        except Exception as e:
+            debug_log(f"Error: {e}")
 
 if __name__ == "__main__":
     print("Bot is starting...")

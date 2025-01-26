@@ -1,6 +1,7 @@
 {
   "bot_token": "${BOT_TOKEN}",
   "chat_id": "${CHAT_ID}",
+  "debug": true,
   "thresholds": {
     "cpu_load": 90.0,
     "temperature": 70.0,
