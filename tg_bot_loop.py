@@ -47,12 +47,12 @@ def get_available_months(year):
     if not os.path.exists(year_path):
         return []
     months = []
-    month_names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
     for folder in sorted(os.listdir(year_path)):
         if os.path.isdir(os.path.join(year_path, folder)):
-            month_number = folder.split("_")[-1].zfill(2)
-            month_name = month_names[int(month_number) - 1]
-            months.append(f"{month_name}\t{month_number}")
+            parts = folder.split("_")
+            if len(parts) == 2:
+                month_name, month_number = parts
+                months.append(f"{month_name:<15}{month_number.zfill(2)}")
     return months
 
 def get_available_days(year, month):
@@ -64,8 +64,8 @@ def get_available_days(year, month):
         if file_name.endswith(".csv"):
             day, weekday = file_name.split("_")
             day_number = day.zfill(2)  # Ensure zero-padded day
-            days.append(f"{weekday.split('.')[0]}\t{day_number}")
-    return sorted(days, key=lambda x: int(x.split('\t')[1]))
+            days.append(f"{weekday.split('.')[0]:<10}{day_number}")
+    return sorted(days, key=lambda x: int(x.split()[1]))
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
@@ -121,10 +121,10 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
     elif stage == "month":
         year = user_data.get("year")
         months = get_available_months(year)
-        month_numbers = [m.split('\t')[1] for m in months]
+        month_numbers = [m.split()[1] for m in months]
         if text.zfill(2) in month_numbers:
-            month_name = [m.split('\t')[0] for m in months if m.endswith(f"\t{text.zfill(2)}")][0]
-            user_data["month"] = f"Mon_{text.zfill(2)}"
+            month_name = [m.split()[0] for m in months if m.endswith(f"{text.zfill(2)}")][0]
+            user_data["month"] = f"{month_name}_{text.zfill(2)}"
             user_data["stage"] = "day"
             days = get_available_days(year, user_data["month"])
             send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:")
@@ -134,10 +134,10 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
     elif stage == "day":
         year, month = user_data.get("year"), user_data.get("month")
         days = get_available_days(year, month)
-        day_numbers = [d.split('\t')[1] for d in days]
+        day_numbers = [d.split()[1] for d in days]
         if text.zfill(2) in day_numbers:
             day_number = text.zfill(2)
-            weekday = [d.split('\t')[0] for d in days if d.endswith(f"\t{day_number}")][0]
+            weekday = [d.split()[0] for d in days if d.endswith(f"{day_number}")][0]
             log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
             if os.path.exists(log_path):
                 send_message(chat_id, "Fetching the log...")
