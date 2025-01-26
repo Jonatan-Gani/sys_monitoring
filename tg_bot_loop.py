@@ -1,7 +1,8 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import time
 
 # Load environment variables
 load_dotenv()
@@ -40,12 +41,32 @@ def send_document(chat_id, file_path):
     with open(file_path, "rb") as file:
         requests.post(f"{TELEGRAM_API_URL}/sendDocument", files={"document": file}, data={"chat_id": chat_id})
 
-def handle_user_input(chat_id, user_id, text, user_data):
+def reset_session(chat_id, user_sessions):
+    user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
+    years = get_available_years()
+    send_message(chat_id, f"Session reset due to inactivity. Available years: {', '.join(years)}\nEnter the year:")
+
+def handle_user_input(chat_id, user_id, text, user_sessions):
     if not user_is_authorized(user_id):
         send_message(chat_id, "Unauthorized user.")
         return
 
+    user_data = user_sessions.get(chat_id, {})
     stage = user_data.get("stage", "year")
+
+    # Update last active time
+    user_data["last_active"] = datetime.now()
+
+    if text.lower() == "back":
+        if stage == "month":
+            user_data["stage"] = "year"
+            years = get_available_years()
+            send_message(chat_id, f"Available years: {', '.join(years)}\nEnter the year:")
+        elif stage == "day":
+            user_data["stage"] = "month"
+            months = get_available_months(user_data.get("year"))
+            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12):")
+        return
 
     if stage == "year":
         years = get_available_years()
@@ -53,7 +74,7 @@ def handle_user_input(chat_id, user_id, text, user_data):
             user_data["year"] = text
             user_data["stage"] = "month"
             months = get_available_months(text)
-            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12):")
+            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12). Type 'back' to go back:")
         else:
             send_message(chat_id, f"Invalid year. Available years: {', '.join(years)}")
 
@@ -64,7 +85,7 @@ def handle_user_input(chat_id, user_id, text, user_data):
             user_data["month"] = text
             user_data["stage"] = "day"
             days = get_available_days(year, text)
-            send_message(chat_id, f"Available days: {', '.join(days)}\nEnter the day:")
+            send_message(chat_id, f"Available days: {', '.join(days)}\nEnter the day. Type 'back' to go back:")
         else:
             send_message(chat_id, f"Invalid month. Available months: {', '.join(months)}")
 
@@ -94,15 +115,20 @@ def poll_updates():
             user_id = update["message"]["from"]["id"]
             text = update["message"].get("text", "")
 
+            # Reset session after 20 seconds of inactivity
+            if chat_id in user_sessions:
+                last_active = user_sessions[chat_id].get("last_active")
+                if last_active and datetime.now() - last_active > timedelta(seconds=20):
+                    reset_session(chat_id, user_sessions)
+                    continue
+
             if chat_id not in user_sessions:
-                user_sessions[chat_id] = {}
+                user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
 
             if text.lower() == "/getlog":
-                user_sessions[chat_id] = {"stage": "year"}
-                years = get_available_years()
-                send_message(chat_id, f"Available years: {', '.join(years)}\nEnter the year:")
+                reset_session(chat_id, user_sessions)
             else:
-                handle_user_input(chat_id, user_id, text, user_sessions[chat_id])
+                handle_user_input(chat_id, user_id, text, user_sessions)
 
 if __name__ == "__main__":
     print("Bot is starting...")
