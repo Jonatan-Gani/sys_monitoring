@@ -64,7 +64,7 @@ def get_available_days(year, month):
         if file_name.endswith(".csv"):
             day, weekday = file_name.split("_")
             day_number = day.zfill(2)  # Ensure zero-padded day
-            days.append(f"{weekday.split('.')[0]:<15}{day_number}")
+            days.append(f"{weekday.split('.')[0]:<20}{day_number}")
     return sorted(days, key=lambda x: int(x.split()[1]))
 
 def user_is_authorized(user_id):
