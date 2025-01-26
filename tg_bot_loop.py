@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 import json
 import signal
 import sys
-import time
 
 # Load environment variables
 load_dotenv()
@@ -74,7 +73,7 @@ def user_is_authorized(user_id):
 
 def send_message(chat_id, text):
     debug_log(f"Sending message to {chat_id}: {text}")
-    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
 def send_document(chat_id, file_path):
     debug_log(f"Sending document to {chat_id}: {file_path}")
@@ -107,7 +106,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
         elif stage == "day":
             user_data["stage"] = "month"
             months = get_available_months(user_data.get("year"))
-            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12):", parse_mode="Markdown")
+            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12):")
         return
 
     if stage == "year":
@@ -116,7 +115,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["year"] = text
             user_data["stage"] = "month"
             months = get_available_months(text)
-            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12). Type 'back' to go back:", parse_mode="Markdown")
+            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12). Type 'back' to go back:")
         else:
             send_message(chat_id, f"Invalid year. Available years:\n{', '.join(years)}")
 
@@ -130,9 +129,9 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["month"] = f"{month_name}_{text.zfill(2)}"
             user_data["stage"] = "day"
             days = get_available_days(year, user_data["month"])
-            send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:", parse_mode="Markdown")
+            send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:")
         else:
-            send_message(chat_id, f"Invalid month. Available months:\n{chr(10).join(months)}", parse_mode="Markdown")
+            send_message(chat_id, f"Invalid month. Available months:\n{chr(10).join(months)}")
 
     elif stage == "day":
         year, month = user_data.get("year"), user_data.get("month")
@@ -148,7 +147,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             else:
                 send_message(chat_id, "Log not found for the specified date.")
         else:
-            send_message(chat_id, f"Invalid day. Available days:\n{chr(10).join(days)}", parse_mode="Markdown")
+            send_message(chat_id, f"Invalid day. Available days:\n{chr(10).join(days)}")
 
 def poll_updates():
     offset = None
