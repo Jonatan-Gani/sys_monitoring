@@ -52,7 +52,7 @@ def get_available_months(year):
             parts = folder.split("_")
             if len(parts) == 2:
                 month_name, month_number = parts
-                months.append(f"{month_name:<15}{month_number.zfill(2)}")
+                months.append(f"{month_name}\t{month_number.zfill(2)}")  # Use tabs for alignment
     return months
 
 def get_available_days(year, month):
@@ -64,8 +64,9 @@ def get_available_days(year, month):
         if file_name.endswith(".csv"):
             day, weekday = file_name.split("_")
             day_number = day.zfill(2)  # Ensure zero-padded day
-            days.append(f"{weekday.split('.')[0]:<20}{day_number}")
-    return sorted(days, key=lambda x: int(x.split()[1]))
+            days.append(f"{weekday.split('.')[0]}\t{day_number}")  # Use tabs for alignment
+    return sorted(days, key=lambda x: int(x.split("\t")[1]))  # Split by tab
+
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
