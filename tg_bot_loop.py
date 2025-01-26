@@ -52,7 +52,7 @@ def get_available_months(year):
             parts = folder.split("_")
             if len(parts) == 2:
                 month_name, month_number = parts
-                months.append(f"{month_name}\t\t{month_number.zfill(2)}")  # Use tabs for alignment
+                months.append(f"`{month_name:<15}{month_number.zfill(2)}`")  # Markdown code block
     return months
 
 def get_available_days(year, month):
@@ -64,16 +64,21 @@ def get_available_days(year, month):
         if file_name.endswith(".csv"):
             day, weekday = file_name.split("_")
             day_number = day.zfill(2)  # Ensure zero-padded day
-            days.append(f"{weekday.split('.')[0]}\t\t{day_number}")  # Use tabs for alignment
-    return sorted(days, key=lambda x: int(x.split("\t")[1]))  # Split by tab
+            days.append(f"`{weekday.split('.')[0]:<10}{day_number}`")  # Markdown code block
+    return sorted(days, key=lambda x: int(x.split()[1]))
+
 
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, parse_mode=None):
     debug_log(f"Sending message to {chat_id}: {text}")
-    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    })
 
 def send_document(chat_id, file_path):
     debug_log(f"Sending document to {chat_id}: {file_path}")
@@ -102,11 +107,11 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
         if stage == "month":
             user_data["stage"] = "year"
             years = get_available_years()
-            send_message(chat_id, f"Available years:\n{', '.join(years)}\nEnter the year:")
+            send_message(chat_id, f"Available years:\n{chr(10).join(years)}\nEnter the year:")
         elif stage == "day":
             user_data["stage"] = "month"
             months = get_available_months(user_data.get("year"))
-            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12):")
+            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12):", parse_mode="Markdown")
         return
 
     if stage == "year":
@@ -115,30 +120,31 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["year"] = text
             user_data["stage"] = "month"
             months = get_available_months(text)
-            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12). Type 'back' to go back:")
+            send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12). Type 'back' to go back:", parse_mode="Markdown")
         else:
-            send_message(chat_id, f"Invalid year. Available years:\n{', '.join(years)}")
+            send_message(chat_id, f"Invalid year. Available years:\n{chr(10).join(years)}")
 
     elif stage == "month":
         year = user_data.get("year")
         months = get_available_months(year)
-        month_numbers = [m.split()[1] for m in months]
+        month_numbers = [m.split("\t")[1] for m in months]
         if text.zfill(2) in month_numbers:
-            month_name = [m.split()[0] for m in months if m.endswith(f"{text.zfill(2)}")][0]
+            selected_month = [m for m in months if m.endswith(f"\t{text.zfill(2)}")][0]
+            month_name = selected_month.split("\t")[0]
             user_data["month"] = f"{month_name}_{text.zfill(2)}"
             user_data["stage"] = "day"
             days = get_available_days(year, user_data["month"])
-            send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:")
+            send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:", parse_mode="Markdown")
         else:
-            send_message(chat_id, f"Invalid month. Available months:\n{chr(10).join(months)}")
+            send_message(chat_id, f"Invalid month. Available months:\n{chr(10).join(months)}", parse_mode="Markdown")
 
     elif stage == "day":
         year, month = user_data.get("year"), user_data.get("month")
         days = get_available_days(year, month)
-        day_numbers = [d.split()[1] for d in days]
+        day_numbers = [d.split("\t")[1] for d in days]
         if text.zfill(2) in day_numbers:
             day_number = text.zfill(2)
-            weekday = [d.split()[0] for d in days if d.endswith(f"{day_number}")][0]
+            weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
             if os.path.exists(log_path):
                 send_message(chat_id, "Fetching the log...")
@@ -146,7 +152,8 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             else:
                 send_message(chat_id, "Log not found for the specified date.")
         else:
-            send_message(chat_id, f"Invalid day. Available days:\n{chr(10).join(days)}")
+            send_message(chat_id, f"Invalid day. Available days:\n{chr(10).join(days)}", parse_mode="Markdown")
+
 
 def poll_updates():
     offset = None
