@@ -51,7 +51,7 @@ def get_available_months(year):
             parts = folder.split("_")
             if len(parts) == 2:
                 month_name, month_number = parts
-                months.append(f"{month_name} ({month_number.zfill(2)})")
+                months.append(f"{month_name}\t{month_number.zfill(2)}")
     return months
 
 def get_available_days(year, month):
@@ -65,15 +65,15 @@ def get_available_days(year, month):
             if len(parts) == 2:
                 day, weekday = parts
                 day_number = day.zfill(2)  # Ensure zero-padded day
-                days.append(f"- *{weekday.split('.')[0]}*: {day_number}")  # Markdown bullet format
-    return days
+                days.append(f"{weekday.split('.')[0]}\t{day_number}")
+    return sorted(days, key=lambda x: int(x.split("\t")[1]))
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
 def send_message(chat_id, text):
     debug_log(f"Sending message to {chat_id}: {text}")
-    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 def send_document(chat_id, file_path):
     debug_log(f"Sending document to {chat_id}: {file_path}")
@@ -84,7 +84,7 @@ def reset_session(chat_id, user_sessions):
     debug_log(f"Resetting session for {chat_id}")
     user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
     years = get_available_years()
-    send_message(chat_id, f"Session reset due to inactivity. Available years:\n{', '.join(years)}\nEnter the year:")
+    send_message(chat_id, f"Session reset due to inactivity. Available years:\n{chr(10).join(years)}\nEnter the year:")
 
 def handle_user_input(chat_id, user_id, text, user_sessions):
     if not user_is_authorized(user_id):
@@ -102,7 +102,7 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
         if stage == "month":
             user_data["stage"] = "year"
             years = get_available_years()
-            send_message(chat_id, f"Available years:\n{', '.join(years)}\nEnter the year:")
+            send_message(chat_id, f"Available years:\n{chr(10).join(years)}\nEnter the year:")
         elif stage == "day":
             user_data["stage"] = "month"
             months = get_available_months(user_data.get("year"))
@@ -117,15 +117,15 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             months = get_available_months(text)
             send_message(chat_id, f"Available months:\n{chr(10).join(months)}\nEnter the month number (e.g., 12). Type 'back' to go back:")
         else:
-            send_message(chat_id, f"Invalid year. Available years:\n{', '.join(years)}")
+            send_message(chat_id, f"Invalid year. Available years:\n{chr(10).join(years)}")
 
     elif stage == "month":
         year = user_data.get("year")
         months = get_available_months(year)
-        month_numbers = [m.split()[1] for m in months]
+        month_numbers = [m.split("\t")[1] for m in months]
         if text.zfill(2) in month_numbers:
-            selected_month = [m for m in months if f"({text.zfill(2)})" in m][0]
-            month_name = selected_month.split()[0]
+            selected_month = [m for m in months if m.endswith(f"\t{text.zfill(2)}")][0]
+            month_name = selected_month.split("\t")[0]
             user_data["month"] = f"{month_name}_{text.zfill(2)}"
             user_data["stage"] = "day"
             days = get_available_days(year, user_data["month"])
@@ -136,10 +136,10 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
     elif stage == "day":
         year, month = user_data.get("year"), user_data.get("month")
         days = get_available_days(year, month)
-        day_numbers = [d.split(': ')[1] for d in days]
+        day_numbers = [d.split("\t")[1] for d in days]
         if text.zfill(2) in day_numbers:
             day_number = text.zfill(2)
-            weekday = [d.split(': ')[0].replace('- *', '').replace('*', '') for d in days if day_number in d][0]
+            weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
             if os.path.exists(log_path):
                 send_message(chat_id, "Fetching the log...")
