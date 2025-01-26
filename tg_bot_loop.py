@@ -52,7 +52,13 @@ def get_available_days(year, month):
     month_path = os.path.join(LOGS_DIRECTORY, year, month)
     if not os.path.exists(month_path):
         return []
-    return sorted([f.split("_")[0] for f in os.listdir(month_path) if f.endswith(".csv")])
+    days = []
+    for file_name in os.listdir(month_path):
+        if file_name.endswith(".csv"):
+            day, weekday = file_name.split("_")
+            day_number = day.zfill(2)  # Ensure zero-padded day
+            days.append(f"{weekday.split('.')[0]} - {day_number}")
+    return sorted(days, key=lambda x: int(x.split('-')[1].strip()))
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
@@ -70,7 +76,7 @@ def reset_session(chat_id, user_sessions):
     debug_log(f"Resetting session for {chat_id}")
     user_sessions[chat_id] = {"stage": "year", "last_active": datetime.now()}
     years = get_available_years()
-    send_message(chat_id, f"Session reset due to inactivity. Available years: {', '.join(years)}\nEnter the year:")
+    send_message(chat_id, f"Session reset due to inactivity. Available years:\n{', '.join(years)}\nEnter the year:")
 
 def handle_user_input(chat_id, user_id, text, user_sessions):
     if not user_is_authorized(user_id):
@@ -88,11 +94,11 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
         if stage == "month":
             user_data["stage"] = "year"
             years = get_available_years()
-            send_message(chat_id, f"Available years: {', '.join(years)}\nEnter the year:")
+            send_message(chat_id, f"Available years:\n{', '.join(years)}\nEnter the year:")
         elif stage == "day":
             user_data["stage"] = "month"
             months = get_available_months(user_data.get("year"))
-            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month:")
+            send_message(chat_id, f"Available months:\n{', '.join(months)}\nEnter the month:")
         return
 
     if stage == "year":
@@ -101,9 +107,9 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["year"] = text
             user_data["stage"] = "month"
             months = get_available_months(text)
-            send_message(chat_id, f"Available months: {', '.join(months)}\nEnter the month. Type 'back' to go back:")
+            send_message(chat_id, f"Available months:\n{', '.join(months)}\nEnter the month. Type 'back' to go back:")
         else:
-            send_message(chat_id, f"Invalid year. Available years: {', '.join(years)}")
+            send_message(chat_id, f"Invalid year. Available years:\n{', '.join(years)}")
 
     elif stage == "month":
         year = user_data.get("year")
@@ -112,22 +118,25 @@ def handle_user_input(chat_id, user_id, text, user_sessions):
             user_data["month"] = text
             user_data["stage"] = "day"
             days = get_available_days(year, text)
-            send_message(chat_id, f"Available days: {', '.join(days)}\nEnter the day. Type 'back' to go back:")
+            send_message(chat_id, f"Available days:\n{chr(10).join(days)}\nEnter the day number (e.g., 11). Type 'back' to go back:")
         else:
-            send_message(chat_id, f"Invalid month. Available months: {', '.join(months)}")
+            send_message(chat_id, f"Invalid month. Available months:\n{', '.join(months)}")
 
     elif stage == "day":
         year, month = user_data.get("year"), user_data.get("month")
         days = get_available_days(year, month)
-        if text in days:
-            log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{text}_{datetime.strptime(text, '%d').strftime('%A')}.csv")
+        day_numbers = [d.split('-')[1].strip() for d in days]
+        if text.zfill(2) in day_numbers:
+            day_number = text.zfill(2)
+            weekday = [d.split('-')[0].strip() for d in days if d.endswith(f"- {day_number}")][0]
+            log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
             if os.path.exists(log_path):
                 send_message(chat_id, "Fetching the log...")
                 send_document(chat_id, log_path)
             else:
                 send_message(chat_id, "Log not found for the specified date.")
         else:
-            send_message(chat_id, f"Invalid day. Available days: {', '.join(days)}")
+            send_message(chat_id, f"Invalid day. Available days:\n{chr(10).join(days)}")
 
 def poll_updates():
     offset = None
