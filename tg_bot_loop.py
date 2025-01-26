@@ -1,5 +1,6 @@
+import asyncio
+import json
 import os
-import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -7,69 +8,115 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-AUTHORIZED_USERS = os.getenv("AUTHORIZED_USERS", "").split(",")
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+AUTHORIZED_USERS = os.getenv("AUTHORIZED_USERS", "").split(",")  # Comma-separated list of authorized users
 LOGS_DIRECTORY = "logs/log_archive"
 LATEST_LOG_FILE = "logs/power_log.csv"
 
+# Helper functions
+def get_available_years():
+    if not os.path.exists(LOGS_DIRECTORY):
+        return []
+    return sorted([d for d in os.listdir(LOGS_DIRECTORY) if d.isdigit()])
 
-def get_log_file_path(year, month, day):
-    return os.path.join(LOGS_DIRECTORY, f"{year}/Mon_{str(month).zfill(2)}/{day}_{datetime(year, month, day).strftime('%A')}.csv")
+def get_available_months(year):
+    year_path = os.path.join(LOGS_DIRECTORY, year)
+    if not os.path.exists(year_path):
+        return []
+    return sorted([d for d in os.listdir(year_path) if d.startswith("Mon_")])
 
+def get_available_days(year, month):
+    month_path = os.path.join(LOGS_DIRECTORY, year, month)
+    if not os.path.exists(month_path):
+        return []
+    return sorted([f.split("_")[0] for f in os.listdir(month_path) if f.endswith(".csv")])
 
 def user_is_authorized(user_id):
     return str(user_id) in AUTHORIZED_USERS
 
+async def send_delayed_message(context, chat_id, message):
+    await asyncio.sleep(1)
+    await context.bot.send_message(chat_id=chat_id, text=message)
 
-def send_message(chat_id, text):
-    requests.post(f"{TELEGRAM_API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+# Handlers
+async def start(update, context):
+    if not user_is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized user.")
+        return
+    print(f"Authorized user {update.effective_user.id} started interaction.")
+    await send_delayed_message(context, update.effective_chat.id, "Welcome! Use /getlog to request logs.")
 
-
-def send_document(chat_id, file_path):
-    with open(file_path, "rb") as file:
-        requests.post(f"{TELEGRAM_API_URL}/sendDocument", files={"document": file}, data={"chat_id": chat_id})
-
-
-def handle_user_input(chat_id, user_id, text):
-    if not user_is_authorized(user_id):
-        send_message(chat_id, "Unauthorized user.")
+async def get_log(update, context):
+    if not user_is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized user.")
         return
 
-    if text.lower() == "c":
-        if os.path.exists(LATEST_LOG_FILE):
-            send_message(chat_id, "Fetching the latest log...")
-            send_document(chat_id, LATEST_LOG_FILE)
-        else:
-            send_message(chat_id, "No logs available.")
-        return
+    print(f"User {update.effective_user.id} initiated log retrieval.")
+    context.user_data.clear()
+    context.user_data['stage'] = 'year'
 
-    parts = text.split("-")
-    if len(parts) == 3:
-        try:
-            year, month, day = map(int, parts)
-            log_path = get_log_file_path(year, month, day)
-            if os.path.exists(log_path):
-                send_message(chat_id, "Fetching the log...")
-                send_document(chat_id, log_path)
-            else:
-                send_message(chat_id, "Log not found for the specified date.")
-        except ValueError:
-            send_message(chat_id, "Invalid date format. Use YYYY-MM-DD.")
+    years = get_available_years()
+    if years:
+        await send_delayed_message(context, update.effective_chat.id, f"Available years: {', '.join(years)}\nEnter the year:")
     else:
-        send_message(chat_id, "Invalid input. Use 'c' for the latest log or provide a date in YYYY-MM-DD format.")
+        await send_delayed_message(context, update.effective_chat.id, "No logs available.")
 
+async def message_handler(update, context):
+    if not user_is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized user.")
+        return
 
-def poll_updates():
-    offset = None
-    while True:
-        response = requests.get(f"{TELEGRAM_API_URL}/getUpdates", params={"offset": offset, "timeout": 30}).json()
-        for update in response.get("result", []):
-            offset = update["update_id"] + 1
-            chat_id = update["message"]["chat"]["id"]
-            user_id = update["message"]["from"]["id"]
-            text = update["message"].get("text", "")
-            handle_user_input(chat_id, user_id, text)
+    user_input = update.message.text.strip()
+    stage = context.user_data.get('stage')
 
+    if stage == 'year':
+        years = get_available_years()
+        if user_input in years:
+            context.user_data['year'] = user_input
+            context.user_data['stage'] = 'month'
+
+            months = get_available_months(user_input)
+            await send_delayed_message(context, update.effective_chat.id, f"Available months: {', '.join(months)}\nEnter the month (e.g., Mon_12):")
+        else:
+            await send_delayed_message(context, update.effective_chat.id, f"Invalid year. Available years: {', '.join(years)}")
+
+    elif stage == 'month':
+        year = context.user_data.get('year')
+        months = get_available_months(year)
+        if user_input in months:
+            context.user_data['month'] = user_input
+            context.user_data['stage'] = 'day'
+
+            days = get_available_days(year, user_input)
+            await send_delayed_message(context, update.effective_chat.id, f"Available days: {', '.join(days)}\nEnter the day:")
+        else:
+            await send_delayed_message(context, update.effective_chat.id, f"Invalid month. Available months: {', '.join(months)}")
+
+    elif stage == 'day':
+        year, month = context.user_data.get('year'), context.user_data.get('month')
+        days = get_available_days(year, month)
+        if user_input in days:
+            log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{user_input}_{datetime.strptime(user_input, '%d').strftime('%A')}.csv")
+            if os.path.exists(log_path):
+                await send_delayed_message(context, update.effective_chat.id, "Fetching the log...")
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=open(log_path, "rb"))
+                print(f"Log for {year}-{month}-{user_input} sent to user {update.effective_user.id}.")
+            else:
+                await send_delayed_message(context, update.effective_chat.id, "Log not found for the specified date.")
+        else:
+            await send_delayed_message(context, update.effective_chat.id, f"Invalid day. Available days: {', '.join(days)}")
+
+# Main function
+async def main():
+    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("getlog", get_log))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    print("Bot is starting...")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    poll_updates()
+    asyncio.run(main())
