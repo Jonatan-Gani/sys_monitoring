@@ -332,6 +332,7 @@ def handle_callback_query(callback_query, user_sessions):
             days = get_available_days(year, month)
             logger.info(f"days available: {days}")
             day_number = str(int(value))
+            logger.info(f"day_number: {day_number}  -----  from: {value}")
             weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             logger.info(f"Day selected: {day_number} ({weekday})")
 
