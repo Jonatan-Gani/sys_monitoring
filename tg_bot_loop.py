@@ -331,14 +331,14 @@ def handle_callback_query(callback_query, user_sessions):
             year, month = user_data.get("year"), user_data.get("month")
             days = get_available_days(year, month)
             logger.info(f"days available: {days}")
-            day_number = str(int(value))
+            day_number = value.zfill(2)
             logger.info(f"day_number: {day_number}  -----  from: {value}")
             weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             logger.info(f"Day selected: {day_number} ({weekday})")
 
 
 
-            log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
+            log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{str(int(day_number))}_{weekday}.csv")
 
             # Answer the callback query
             requests.post(f"{TELEGRAM_API_URL}/answerCallbackQuery",
