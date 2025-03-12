@@ -327,7 +327,7 @@ def handle_callback_query(callback_query, user_sessions):
         elif item_type == "day":
             year, month = user_data.get("year"), user_data.get("month")
             days = get_available_days(year, month)
-            day_number = str(value)
+            day_number = str(int(value))
             weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             logger.info(f"Day selected: {day_number} ({weekday})")
 
