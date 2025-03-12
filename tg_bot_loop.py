@@ -327,7 +327,7 @@ def handle_callback_query(callback_query, user_sessions):
         elif item_type == "day":
             year, month = user_data.get("year"), user_data.get("month")
             days = get_available_days(year, month)
-            day_number = value.zfill(2)
+            day_number = str(value)
             weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             logger.info(f"Day selected: {day_number} ({weekday})")
 
@@ -350,7 +350,8 @@ def handle_callback_query(callback_query, user_sessions):
                 send_message(chat_id, "Select another year or use /getlog to start over:", keyboard)
             else:
                 logger.warning(f"Log file not found: {log_path}")
-                send_message(chat_id, "Log not found for the specified date.")
+                send_message(chat_id, f"Log not found for the specified date; "
+                                      f"{year}, {month}, {day_number}/{weekday}")
 
 
 def edit_message(chat_id, message_id, text, reply_markup=None):
