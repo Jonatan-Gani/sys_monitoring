@@ -92,6 +92,9 @@ def get_available_months(year):
 
 
 def get_available_days(year, month):
+    logger.info(f"get_available_days - os.path.join LOGS_DIRECTORY: {LOGS_DIRECTORY}, {type(LOGS_DIRECTORY)}")
+    logger.info(f"get_available_days - os.path.join year: {year}, {type(year)}")
+    logger.info(f"get_available_days - os.path.join month: {month}, {type(month)}")
     month_path = os.path.join(LOGS_DIRECTORY, year, month)
     if not os.path.exists(month_path):
         logger.warning(f"Month directory not found: {month_path}")
@@ -330,6 +333,8 @@ def handle_callback_query(callback_query, user_sessions):
             day_number = str(int(value))
             weekday = [d.split("\t")[0] for d in days if d.endswith(f"\t{day_number}")][0]
             logger.info(f"Day selected: {day_number} ({weekday})")
+
+
 
             log_path = os.path.join(LOGS_DIRECTORY, year, month, f"{day_number}_{weekday}.csv")
 
