@@ -1,172 +1,126 @@
-# **System Monitoring Script**
+# sys_monitoring
 
-This script monitors system metrics such as CPU load, temperature, RAM usage, disk usage, network activity, and estimates power consumption for a Linux-based system (e.g., Raspberry Pi). It logs the data in a CSV file, archives logs daily, and sends Telegram alerts when thresholds are exceeded.
+Lightweight Linux system monitor with a CSV log archive and an interactive
+Telegram bot. Built for low overhead — the cron logger does one short
+psutil pass per run, and the bot uses long-polling with a single keep-alive
+HTTPS session.
 
----
+## Components
 
-## **Features**
+| File | Role |
+|------|------|
+| `log_pi_status.py` | Cron-invoked metrics collector. Appends to `logs/power_log.csv`, archives daily, fires edge-triggered Telegram alerts. |
+| `tg_bot_loop.py`   | Long-running interactive Telegram bot. |
+| `sysmon_lib.py`    | Shared library: config, metric collection, CSV tail reads, formatters. |
+| `config.json`      | Thresholds, alert policy, power model, bot tuning. |
+| `.env`             | Secrets: `BOT_TOKEN`, `CHAT_ID`, `AUTHORIZED_USERS`. |
 
-- **Metrics Monitored**:
-  - CPU Load
-  - System Temperature
-  - RAM and Disk Usage
-  - Network Sent/Received Data
-  - Estimated Power Consumption (Watt-Hours)
-
-- **Log Management**:
-  - Logs system data to a CSV file (`power_log.csv`).
-  - Archives logs daily into folders with the format `logs/log_archive/YYYY/Mon_MM/`.
-
-- **Alerts**:
-  - Sends Telegram notifications when metrics exceed configured thresholds.
-
-- **Power Estimation**:
-  - Calculates power consumed since the last execution and logs it as Watt-Hours (Wh).
-
----
-
-## **Installation**
-
-### **1. Clone the Repository**
+## Install
 
 ```bash
 git clone https://github.com/Jonatan-Gani/sys_monitoring.git
 cd sys_monitoring
+pip install -r requirements.txt
 ```
 
-### **2. Install Dependencies**
+`.env`:
 
-This script uses `psutil` and `requests`:
+```
+BOT_TOKEN=123456:abc...
+CHAT_ID=11111111
+AUTHORIZED_USERS=11111111,22222222
+```
+
+`AUTHORIZED_USERS` is a comma-separated list of Telegram user IDs allowed to
+talk to the bot. If empty, only `CHAT_ID` is permitted.
+
+## Run
+
+Cron the logger every minute:
+
+```
+* * * * * /usr/bin/python3 /path/to/sys_monitoring/log_pi_status.py
+```
+
+Run the bot as a service (recommended) or directly:
 
 ```bash
-sudo apt update
-sudo apt install python3-psutil python3-requests
+python3 tg_bot_loop.py
 ```
 
-### **3. Create a `.env` File**
+A minimal systemd unit:
 
-Add your Telegram Bot Token and Chat ID to a `.env` file:
+```ini
+[Unit]
+Description=sys_monitoring Telegram bot
+After=network-online.target
 
-```bash
-nano .env
-```
-Add the following content:
+[Service]
+WorkingDirectory=/path/to/sys_monitoring
+ExecStart=/usr/bin/python3 /path/to/sys_monitoring/tg_bot_loop.py
+Restart=on-failure
+RestartSec=5
+User=pi
 
-```
-BOT_TOKEN=your_telegram_bot_token
-CHAT_ID=your_telegram_chat_id
-```
-
-### **4. Configure Thresholds**
-
-Edit the `config.json` file to set threshold values:
-
-```json
-{
-  "bot_token": "${BOT_TOKEN}",
-  "chat_id": "${CHAT_ID}",
-  "thresholds": {
-    "cpu_load": 90.0,
-    "temperature": 70.0,
-    "power": 10.0,
-    "ram_usage": 85.0,
-    "disk_usage": 90.0
-  }
-}
+[Install]
+WantedBy=multi-user.target
 ```
 
-### **5. Schedule the Script**
+## Bot commands
 
-Use `cron` to run the script every minute:
+Compact-by-default — every screen has inline buttons to drill in.
 
-```bash
-crontab -e
-```
-Add the following line:
+| Command | What it shows |
+|---|---|
+| `/start`, `/menu`, `/status` | One-screen snapshot with action buttons |
+| `/cpu` `/ram` `/disk` `/disks` `/temp` `/net` `/uptime` | Targeted live readings |
+| `/top [cpu\|mem]` | Top processes (toggleable) |
+| `/service <unit>` | systemd unit status |
+| `/summary [hours]` | Min/avg/max + energy from CSV (default 24h) |
+| `/latest` | Send current day's CSV |
+| `/getlog` | Browse archived CSVs by year → month → day |
+| `/alerts on\|off\|status` | Runtime alert toggle |
+| `/threshold <name> <value>` | Tune a threshold without editing config |
+| `/help` | Command reference |
 
-```
-* * * * * /usr/bin/python3 /path/to/log_pi_status.py
-```
+Status icons: 🟢 below 85% of threshold, 🟡 85–100%, 🔴 over threshold.
 
----
+## Alerts
 
-## **Logs**
+Edge-triggered, not polled. The first crossing of a threshold sends an
+alert; further crossings are suppressed until either `cooldown_minutes`
+elapses (set in `config.json`) or the metric recovers, at which point a
+single `✅ Recovered` message is sent (toggleable via `alerts.send_recovery`).
 
-- **Current Logs**:
-  - `logs/power_log.csv`: Stores current system metrics.
-- **Archived Logs**:
-  - Logs are archived daily into the `logs/log_archive/YYYY/Mon_MM/` directory.
+State (offset, alert flags, last metric snapshot for network deltas) lives
+in `logs/state/monitor_state.json`.
 
----
-
-## **Usage**
-
-Run the script manually:
-
-```bash
-python3 log_pi_status.py
-```
-
-To automate, ensure `cron` is running and scheduled as mentioned above.
-
----
-
-## **Example Output (CSV)**
+## CSV columns
 
 ```
-Timestamp,CPU Load (%),Temperature (°C),RAM Usage (%),Disk Usage (%),Network Sent (MB),Network Received (MB),Estimated Power (W),Interval Wh
-2024-12-17 20:07:41,34.50,47.40,8.10,83.20,26425.18,17263.80,4.50,0.0750
-2024-12-17 20:08:41,38.10,48.20,9.30,84.10,26427.18,17265.80,5.20,0.0800
+Timestamp, CPU Load (%), Temperature (C), RAM Usage (%), Disk Usage (%),
+Net Sent Total (MB), Net Recv Total (MB),
+Net Sent Delta (MB), Net Recv Delta (MB),
+Load Avg 1m, Estimated Power (W), Interval Wh
 ```
 
----
+Net `Delta` columns are per-interval (true traffic per run); `Total` columns
+are cumulative since boot.
 
-## **Alerts**
-
-The script sends alerts to the specified Telegram chat when thresholds are exceeded:
-
-- **High CPU Load**: ⚠️ High CPU Load: 90.0%
-- **High Temperature**: 🔥 High Temperature: 70.0°C
-- **High Power Consumption**: ⚡ High Power Consumption: 10.0 W
-- **High RAM or Disk Usage**: ⚠️ High RAM Usage: 85.0%
-
----
-
-## **How to Get Telegram Bot Token and Chat ID**
-
-### **1. Create a Telegram Bot**
-
-1. Open Telegram and search for "BotFather".
-2. Start a chat with BotFather and type `/newbot`.
-3. Follow the instructions to set a name and username for your bot.
-4. After creation, you will receive the bot token. KEEP BOT TOKEN PRIVATE AND NEVER SHARE IT!
-
-### **2. Get Your Chat ID**
-
-1. Start a chat with your newly created bot.
-2. Open a browser and go to the following URL, replacing `<BOT_TOKEN>` with your bot's token:
-   ```
-   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
-   ```
-3. Send a message to your bot (e.g., "Hello").
-4. Refresh the URL, and look for the `chat` field in the response JSON. Note down the `id` as your `CHAT_ID`.
-
----
-
-## **Directory Structure**
+## Directory layout
 
 ```
 sys_monitoring/
-│
-├── log_pi_status.py         # Main script
-├── config.json              # Configuration file
-├── .env                     # Environment variables (Telegram API)
-├── logs/
-│   ├── power_log.csv        # Current CSV log
-│   └── log_archive/         # Archived logs
-│       ├── YYYY/
-│       │   └── Mon_MM/
-│       │       └── 17_Tuesday.csv
-└── README.md                # Project README file
+├── log_pi_status.py
+├── tg_bot_loop.py
+├── sysmon_lib.py
+├── config.json
+├── .env
+├── requirements.txt
+└── logs/
+    ├── power_log.csv
+    ├── monitor.log
+    ├── bot_logs/telegram_bot.log
+    ├── state/monitor_state.json
+    └── log_archive/YYYY/Mon_MM/D_Weekday.csv
 ```
-
