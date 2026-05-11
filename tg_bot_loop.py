@@ -296,15 +296,20 @@ def render_net() -> str:
         "*Interfaces*",
     ]
     for nic, counts in per_nic.items():
-        if nic == "lo":
+        # Skip loopback on both Linux ("lo") and Windows
+        # ("Loopback Pseudo-Interface 1", etc.)
+        nic_lower = nic.lower()
+        if nic == "lo" or "loopback" in nic_lower:
             continue
         ip = ""
         for addr in addrs.get(nic, []):
             if addr.family.name in ("AF_INET", "AddressFamily.AF_INET"):
                 ip = addr.address
                 break
+        # Truncate long Windows adapter names for the fixed-width column
+        short = nic if len(nic) <= 14 else nic[:13] + "…"
         lines.append(
-            f"`{nic:<10}` {ip:<15} ↑ {sm.format_bytes(counts.bytes_sent)} "
+            f"`{short:<14}` {ip:<15} ↑ {sm.format_bytes(counts.bytes_sent)} "
             f"↓ {sm.format_bytes(counts.bytes_recv)}"
         )
     return "\n".join(lines)
@@ -601,11 +606,12 @@ def cmd_top(chat_id: int, args: str) -> None:
 def cmd_service(chat_id: int, args: str) -> None:
     unit = args.strip()
     if not unit:
-        send_message(chat_id, "_Usage: `/service <unit-name>`_")
+        send_message(chat_id, "_Usage: `/service <unit-or-service-name>`_")
         return
-    state, sub = sm.systemd_status(unit)
+    state, sub = sm.service_status(unit)
     emoji = {"active": "🟢", "inactive": "⚫", "failed": "🔴",
-             "activating": "🟡", "deactivating": "🟡", "not-found": "❔"}.get(state, "❔")
+             "activating": "🟡", "deactivating": "🟡",
+             "not-found": "❔", "error": "⚠️"}.get(state, "❔")
     sub_part = f" ({sub})" if sub else ""
     send_message(chat_id, f"{emoji} `{unit}` → *{state}*{sub_part}")
 
@@ -963,5 +969,11 @@ def _signal_handler(signum, _frame) -> None:
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
+    # SIGTERM exists on Windows but cannot have a handler installed via
+    # signal.signal() — guard so we don't crash on startup there.
+    if hasattr(signal, "SIGTERM"):
+        try:
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except (ValueError, OSError, AttributeError):
+            pass
     poll_loop()

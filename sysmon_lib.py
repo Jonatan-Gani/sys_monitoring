@@ -18,6 +18,7 @@ import datetime as dt
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import socket
@@ -30,6 +31,10 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Iterable, Iterator
 
 import psutil
+
+
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = os.name == "posix" and platform.system() == "Linux"
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -399,22 +404,56 @@ def list_disks() -> list[dict[str, Any]]:
     return out
 
 
-_SAFE_UNIT = re.compile(r"^[A-Za-z0-9@:._\-]+$")
+_SAFE_UNIT = re.compile(r"^[A-Za-z0-9@:._\- ]+$")
 
 
-def systemd_status(unit: str) -> tuple[str, str]:
-    """Return (active_state, sub_state) for a systemd unit or ('error', msg)."""
-    if not _SAFE_UNIT.match(unit):
-        return ("error", "invalid unit name")
+def service_status(name: str) -> tuple[str, str]:
+    """Cross-platform service status. Returns (state, detail).
+
+    States are normalized so the bot can map them to one set of emojis:
+        active | inactive | failed | activating | deactivating | not-found | error | unknown
+    """
+    name = name.strip()
+    if not name or not _SAFE_UNIT.match(name):
+        return ("error", "invalid service name")
+
+    if IS_WINDOWS:
+        # Use psutil's win_service_get when available — no subprocess parsing needed.
+        get = getattr(psutil, "win_service_get", None)
+        if get is None:
+            return ("error", "win_service_get unavailable in this psutil build")
+        try:
+            svc = get(name)
+            info = svc.as_dict()
+        except Exception as e:
+            # psutil.NoSuchProcess on missing service, else generic
+            cls = type(e).__name__.lower()
+            if "nosuch" in cls:
+                return ("not-found", "")
+            return ("error", str(e))
+        mapping = {
+            "running": "active",
+            "stopped": "inactive",
+            "stop_pending": "deactivating",
+            "start_pending": "activating",
+            "pause_pending": "deactivating",
+            "paused": "inactive",
+            "continue_pending": "activating",
+        }
+        state = mapping.get(info.get("status", "unknown"), info.get("status", "unknown"))
+        detail = info.get("display_name") or info.get("start_type") or ""
+        return (state, str(detail))
+
+    # POSIX / Linux: systemd
     if not shutil.which("systemctl"):
-        return ("error", "systemctl unavailable")
+        return ("error", "no service manager available")
     try:
         import subprocess
         res = subprocess.run(
-            ["systemctl", "show", unit, "--property=ActiveState,SubState,LoadState"],
+            ["systemctl", "show", name, "--property=ActiveState,SubState,LoadState"],
             capture_output=True, text=True, timeout=5,
         )
-        if res.returncode not in (0, 3):  # 3 = unit not active, still valid output
+        if res.returncode not in (0, 3):
             return ("error", res.stderr.strip() or f"exit {res.returncode}")
         kv: dict[str, str] = {}
         for line in res.stdout.splitlines():
@@ -428,19 +467,29 @@ def systemd_status(unit: str) -> tuple[str, str]:
         return ("error", str(e))
 
 
+# Backwards-compatible alias.
+systemd_status = service_status
+
+
 def system_info() -> dict[str, Any]:
     info: dict[str, Any] = {
         "hostname": socket.gethostname(),
         "boot_time": psutil.boot_time(),
         "cpu_count_logical": psutil.cpu_count(logical=True),
         "cpu_count_physical": psutil.cpu_count(logical=False) or 0,
+        "platform": platform.system(),
     }
+
+    # Linux-specific files first; portable fallbacks via `platform` afterwards.
     try:
         with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
             for line in f:
                 if line.lower().startswith("model name"):
                     info["cpu_model"] = line.split(":", 1)[1].strip()
                     break
+    except OSError:
+        pass
+    try:
         with open("/etc/os-release", "r", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("PRETTY_NAME="):
@@ -448,6 +497,12 @@ def system_info() -> dict[str, Any]:
                     break
     except OSError:
         pass
+
+    if "cpu_model" not in info:
+        info["cpu_model"] = platform.processor() or platform.machine() or "?"
+    if "os" not in info:
+        # platform.platform() is verbose; trim common Windows form
+        info["os"] = platform.platform(terse=True)
     return info
 
 

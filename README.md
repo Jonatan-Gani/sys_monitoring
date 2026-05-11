@@ -32,6 +32,12 @@ At ~1 row/min the DB grows about 50 MB/year. Retention is enforced via
 upgrade, existing `logs/power_log.csv` and `logs/log_archive/**/*.csv` files
 are imported automatically (idempotent — re-runs are no-ops).
 
+Runs on **Linux** and **Windows**. On Linux it reads `/sys/class/thermal`
+for temperature and uses `systemctl` for `/service`. On Windows it uses
+psutil's WMI-backed sensors (temperature usually shows `n/a` — Windows
+doesn't expose CPU thermals through a standard API) and `psutil.win_service_get`
+for `/service`.
+
 ## Install
 
 ```bash
@@ -51,7 +57,7 @@ AUTHORIZED_USERS=11111111,22222222
 `AUTHORIZED_USERS` is a comma-separated list of Telegram user IDs allowed to
 talk to the bot. If empty, only `CHAT_ID` is permitted.
 
-## Run
+## Run · Linux
 
 Cron the logger every minute:
 
@@ -82,6 +88,42 @@ User=pi
 [Install]
 WantedBy=multi-user.target
 ```
+
+## Run · Windows
+
+Schedule the logger every minute with Task Scheduler. From an elevated
+PowerShell prompt (replace paths to match your install):
+
+```powershell
+$exe = "C:\Python312\python.exe"
+$arg = "C:\path\to\sys_monitoring\log_pi_status.py"
+schtasks /Create /TN "sys_monitoring_logger" `
+  /TR "`"$exe`" `"$arg`"" `
+  /SC MINUTE /MO 1 /RL HIGHEST /F
+```
+
+Run the bot. For an interactive test:
+
+```powershell
+python tg_bot_loop.py
+```
+
+For a hands-off persistent run, either:
+
+1. **Task Scheduler** with trigger "At log on" / "At startup" and action
+   `pythonw.exe C:\path\to\sys_monitoring\tg_bot_loop.py` (note `pythonw.exe`
+   — runs without a console window). Tick "If the task fails, restart every
+   1 minute".
+2. **NSSM** (Non-Sucking Service Manager) to wrap it as a proper Windows
+   service:
+   ```cmd
+   nssm install sys_monitoring_bot "C:\Python312\python.exe" "C:\path\to\sys_monitoring\tg_bot_loop.py"
+   nssm set    sys_monitoring_bot AppDirectory "C:\path\to\sys_monitoring"
+   nssm start  sys_monitoring_bot
+   ```
+
+`/service <name>` on Windows expects a service name from
+`Get-Service` (e.g. `Spooler`, `wuauserv`), not a `.service` unit name.
 
 ## Bot commands
 
