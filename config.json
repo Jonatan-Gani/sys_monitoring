@@ -16,6 +16,10 @@
     "idle_watts": 4.5,
     "load_watts": 7.5
   },
+  "storage": {
+    "retention_days": 365,
+    "auto_migrate_csv": true
+  },
   "bot": {
     "poll_timeout": 30,
     "session_timeout_seconds": 120,

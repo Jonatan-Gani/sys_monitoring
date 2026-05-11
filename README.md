@@ -1,19 +1,36 @@
 # sys_monitoring
 
-Lightweight Linux system monitor with a CSV log archive and an interactive
-Telegram bot. Built for low overhead — the cron logger does one short
-psutil pass per run, and the bot uses long-polling with a single keep-alive
-HTTPS session.
+Lightweight Linux system monitor with a SQLite-backed time-series store and
+an interactive Telegram bot. Built for low overhead — the cron logger does
+one short psutil pass per run and a single SQL insert, and the bot uses
+long-polling with a keep-alive HTTPS session. SQLite WAL mode lets the bot
+read freely while the logger writes.
 
 ## Components
 
 | File | Role |
 |------|------|
-| `log_pi_status.py` | Cron-invoked metrics collector. Appends to `logs/power_log.csv`, archives daily, fires edge-triggered Telegram alerts. |
+| `log_pi_status.py` | Cron-invoked metrics collector. Inserts one row into `logs/sysmon.db`, fires edge-triggered Telegram alerts, prunes per retention. |
 | `tg_bot_loop.py`   | Long-running interactive Telegram bot. |
-| `sysmon_lib.py`    | Shared library: config, metric collection, CSV tail reads, formatters. |
-| `config.json`      | Thresholds, alert policy, power model, bot tuning. |
+| `sysmon_lib.py`    | Shared library: SQLite layer, config, metric collection, formatters, legacy-CSV importer. |
+| `config.json`      | Thresholds, alert policy, power model, retention, bot tuning. |
 | `.env`             | Secrets: `BOT_TOKEN`, `CHAT_ID`, `AUTHORIZED_USERS`. |
+
+## Storage
+
+Metrics live in `logs/sysmon.db` (SQLite, WAL mode). Schema:
+
+```sql
+metrics       (ts INTEGER PK, cpu_load, temperature, ram_usage, disk_usage,
+               net_*_total_mb, net_*_delta_mb, load_avg_1m, power_w, interval_wh)
+alert_events  (id, ts, metric, event['breach'|'recovery'|'continued'], value, threshold)
+schema_meta   (key, value)
+```
+
+At ~1 row/min the DB grows about 50 MB/year. Retention is enforced via
+`storage.retention_days` (default 365; `0` = forever). On first run after
+upgrade, existing `logs/power_log.csv` and `logs/log_archive/**/*.csv` files
+are imported automatically (idempotent — re-runs are no-ops).
 
 ## Install
 
@@ -76,9 +93,11 @@ Compact-by-default — every screen has inline buttons to drill in.
 | `/cpu` `/ram` `/disk` `/disks` `/temp` `/net` `/uptime` | Targeted live readings |
 | `/top [cpu\|mem]` | Top processes (toggleable) |
 | `/service <unit>` | systemd unit status |
-| `/summary [hours]` | Min/avg/max + energy from CSV (default 24h) |
-| `/latest` | Send current day's CSV |
-| `/getlog` | Browse archived CSVs by year → month → day |
+| `/summary [hours]` | Min/avg/max + energy + net (SQL-aggregated, default 24h) |
+| `/latest` | Today's metrics exported as CSV |
+| `/export YYYY-MM-DD` | Export a specific day as CSV |
+| `/getlog` | Browse stored days by year → month → day |
+| `/db` | Database stats (rows, size, time range) |
 | `/alerts on\|off\|status` | Runtime alert toggle |
 | `/threshold <name> <value>` | Tune a threshold without editing config |
 | `/help` | Command reference |
@@ -95,7 +114,9 @@ single `✅ Recovered` message is sent (toggleable via `alerts.send_recovery`).
 State (offset, alert flags, last metric snapshot for network deltas) lives
 in `logs/state/monitor_state.json`.
 
-## CSV columns
+## CSV export columns
+
+When the bot exports a day via `/latest`, `/export`, or `/getlog`:
 
 ```
 Timestamp, CPU Load (%), Temperature (C), RAM Usage (%), Disk Usage (%),
@@ -104,8 +125,8 @@ Net Sent Delta (MB), Net Recv Delta (MB),
 Load Avg 1m, Estimated Power (W), Interval Wh
 ```
 
-Net `Delta` columns are per-interval (true traffic per run); `Total` columns
-are cumulative since boot.
+`Delta` columns are per-interval traffic; `Total` columns are cumulative
+since boot.
 
 ## Directory layout
 
@@ -118,9 +139,11 @@ sys_monitoring/
 ├── .env
 ├── requirements.txt
 └── logs/
-    ├── power_log.csv
-    ├── monitor.log
+    ├── sysmon.db                # SQLite metrics + alert history (WAL)
+    ├── sysmon.db-wal            # write-ahead log
+    ├── sysmon.db-shm            # shared memory
+    ├── monitor.log              # cron logger output
     ├── bot_logs/telegram_bot.log
-    ├── state/monitor_state.json
-    └── log_archive/YYYY/Mon_MM/D_Weekday.csv
+    ├── state/monitor_state.json # bot offset, alert flags, last-prune date
+    └── log_archive/             # legacy CSVs (imported on first run; safe to remove after)
 ```

@@ -21,23 +21,25 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import psutil
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
-ARCHIVE_DIR = os.path.join(LOG_DIR, "log_archive")
-LOG_FILE_CSV = os.path.join(LOG_DIR, "power_log.csv")
+ARCHIVE_DIR = os.path.join(LOG_DIR, "log_archive")           # legacy: kept for import
+LOG_FILE_CSV = os.path.join(LOG_DIR, "power_log.csv")        # legacy: kept for import
 BOT_LOGS_DIR = os.path.join(LOG_DIR, "bot_logs")
 STATE_DIR = os.path.join(LOG_DIR, "state")
 STATE_FILE = os.path.join(STATE_DIR, "monitor_state.json")
+DB_PATH = os.path.join(LOG_DIR, "sysmon.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 
@@ -74,6 +76,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "idle_watts": 4.5,
         "load_watts": 7.5,
     },
+    "storage": {
+        "retention_days": 365,        # 0 = keep forever
+        "auto_migrate_csv": True,     # one-shot import from legacy CSV on first DB use
+    },
     "bot": {
         "poll_timeout": 30,
         "session_timeout_seconds": 120,
@@ -81,6 +87,40 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_processes": 5,
     },
 }
+
+DB_SCHEMA_VERSION = 1
+DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS metrics (
+    ts                INTEGER PRIMARY KEY,
+    cpu_load          REAL NOT NULL,
+    temperature       REAL,
+    ram_usage         REAL NOT NULL,
+    disk_usage        REAL NOT NULL,
+    net_sent_total_mb REAL,
+    net_recv_total_mb REAL,
+    net_sent_delta_mb REAL,
+    net_recv_delta_mb REAL,
+    load_avg_1m       REAL,
+    power_w           REAL NOT NULL,
+    interval_wh       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
+
+CREATE TABLE IF NOT EXISTS alert_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        INTEGER NOT NULL,
+    metric    TEXT NOT NULL,
+    event     TEXT NOT NULL,        -- 'breach' | 'recovery' | 'continued'
+    value     REAL,
+    threshold REAL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alert_events(ts);
+
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +452,319 @@ def system_info() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# CSV helpers
+# SQLite storage
+# ---------------------------------------------------------------------------
+
+_db_init_lock = threading.Lock()
+_db_initialized = False
+
+
+@contextmanager
+def db_connect(readonly: bool = False) -> Iterator[sqlite3.Connection]:
+    """Open the metrics DB. WAL mode → writers don't block readers.
+
+    Use as `with db_connect() as conn:`. Connections auto-close on exit.
+    `readonly=True` uses URI mode for explicit read-only access.
+    """
+    os.makedirs(LOG_DIR, exist_ok=True)
+    if readonly:
+        uri = f"file:{DB_PATH}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=10.0, isolation_level=None)
+    else:
+        # isolation_level=None → autocommit; explicit BEGIN/COMMIT still possible.
+        conn = sqlite3.connect(DB_PATH, timeout=10.0, isolation_level=None)
+    try:
+        conn.row_factory = sqlite3.Row
+        if not readonly:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA foreign_keys=ON")
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+
+def db_init(auto_migrate: bool = True) -> None:
+    """Create schema if missing. Idempotent. Called automatically on first use."""
+    global _db_initialized
+    with _db_init_lock:
+        if _db_initialized:
+            return
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with db_connect() as conn:
+            conn.executescript(DB_SCHEMA)
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
+                (str(DB_SCHEMA_VERSION),),
+            )
+            row = conn.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('migrated_from_csv', '0')"
+            )
+            migrated = conn.execute(
+                "SELECT value FROM schema_meta WHERE key='migrated_from_csv'"
+            ).fetchone()
+        _db_initialized = True
+
+        if auto_migrate and migrated and migrated["value"] == "0":
+            try:
+                imported = migrate_csv_to_db()
+                if imported:
+                    logging.getLogger("sysmon").info(
+                        "Imported %d rows from legacy CSV archives", imported,
+                    )
+            except Exception:
+                logging.getLogger("sysmon").exception("CSV migration failed")
+            finally:
+                with db_connect() as conn:
+                    conn.execute(
+                        "UPDATE schema_meta SET value=? WHERE key='migrated_from_csv'",
+                        (dt.datetime.now().isoformat(),),
+                    )
+
+
+def db_ensure() -> None:
+    """Initialize the DB lazily (called by all read/write helpers)."""
+    if not _db_initialized:
+        db_init()
+
+
+def db_insert_metric(m: "Metrics", interval_wh: float) -> None:
+    db_ensure()
+    ts = int(m.timestamp.timestamp())
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO metrics (
+                ts, cpu_load, temperature, ram_usage, disk_usage,
+                net_sent_total_mb, net_recv_total_mb,
+                net_sent_delta_mb, net_recv_delta_mb,
+                load_avg_1m, power_w, interval_wh
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts, m.cpu_load, m.temperature, m.ram_usage, m.disk_usage,
+                m.net_sent_mb, m.net_recv_mb,
+                m.net_sent_delta_mb, m.net_recv_delta_mb,
+                m.load_avg_1m, m.power_estimation, interval_wh,
+            ),
+        )
+
+
+def db_insert_alert(metric: str, event: str, value: float, threshold: float | None) -> None:
+    db_ensure()
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO alert_events (ts, metric, event, value, threshold) VALUES (?, ?, ?, ?, ?)",
+            (int(time.time()), metric, event, value, threshold),
+        )
+
+
+def db_last_metric() -> dict[str, Any] | None:
+    db_ensure()
+    with db_connect(readonly=True) as conn:
+        row = conn.execute("SELECT * FROM metrics ORDER BY ts DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+
+
+def db_recent_metrics(n: int = 60) -> list[dict[str, Any]]:
+    db_ensure()
+    with db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT * FROM metrics ORDER BY ts DESC LIMIT ?", (int(n),),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def db_summarize_window(since_ts: int, until_ts: int | None = None) -> dict[str, Any]:
+    """Min/avg/max aggregation done by SQL — fast even over months of data."""
+    db_ensure()
+    until_clause = ""
+    params: list[Any] = [since_ts]
+    if until_ts is not None:
+        until_clause = "AND ts < ?"
+        params.append(until_ts)
+    with db_connect(readonly=True) as conn:
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*)           AS n,
+                MIN(cpu_load)      AS cpu_min, AVG(cpu_load)      AS cpu_avg, MAX(cpu_load)      AS cpu_max,
+                MIN(temperature)   AS temp_min, AVG(temperature)  AS temp_avg, MAX(temperature)  AS temp_max,
+                MIN(ram_usage)     AS ram_min, AVG(ram_usage)     AS ram_avg, MAX(ram_usage)     AS ram_max,
+                MIN(disk_usage)    AS disk_min, AVG(disk_usage)   AS disk_avg, MAX(disk_usage)   AS disk_max,
+                MIN(power_w)       AS pow_min, AVG(power_w)       AS pow_avg, MAX(power_w)       AS pow_max,
+                COALESCE(SUM(interval_wh), 0) AS energy_wh,
+                COALESCE(SUM(net_sent_delta_mb), 0) AS net_sent_mb,
+                COALESCE(SUM(net_recv_delta_mb), 0) AS net_recv_mb
+            FROM metrics WHERE ts >= ? {until_clause}
+            """,
+            params,
+        ).fetchone()
+    return dict(row) if row else {"n": 0}
+
+
+def db_available_dates() -> list[str]:
+    """Distinct local-date strings ('YYYY-MM-DD') that have any data."""
+    db_ensure()
+    with db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT date(ts, 'unixepoch', 'localtime') AS d "
+            "FROM metrics ORDER BY d DESC"
+        ).fetchall()
+    return [r["d"] for r in rows]
+
+
+def db_export_csv_for_date(date_iso: str) -> str | None:
+    """Export rows for a local-date as a CSV string. Returns None if empty."""
+    db_ensure()
+    try:
+        day = dt.datetime.strptime(date_iso, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    start = int(dt.datetime.combine(day, dt.time.min).timestamp())
+    end = int(dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).timestamp())
+    with db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT * FROM metrics WHERE ts >= ? AND ts < ? ORDER BY ts",
+            (start, end),
+        ).fetchall()
+    if not rows:
+        return None
+    import io
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "Timestamp", "CPU Load (%)", "Temperature (C)", "RAM Usage (%)",
+        "Disk Usage (%)", "Net Sent Total (MB)", "Net Recv Total (MB)",
+        "Net Sent Delta (MB)", "Net Recv Delta (MB)",
+        "Load Avg 1m", "Estimated Power (W)", "Interval Wh",
+    ])
+    for r in rows:
+        ts_str = dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        writer.writerow([
+            ts_str,
+            f"{r['cpu_load']:.2f}",
+            f"{r['temperature']:.2f}" if r["temperature"] is not None else "N/A",
+            f"{r['ram_usage']:.2f}",
+            f"{r['disk_usage']:.2f}",
+            f"{(r['net_sent_total_mb'] or 0):.2f}",
+            f"{(r['net_recv_total_mb'] or 0):.2f}",
+            f"{(r['net_sent_delta_mb'] or 0):.2f}",
+            f"{(r['net_recv_delta_mb'] or 0):.2f}",
+            f"{(r['load_avg_1m'] or 0):.2f}",
+            f"{r['power_w']:.2f}",
+            f"{(r['interval_wh'] or 0):.4f}",
+        ])
+    return buf.getvalue()
+
+
+def db_purge_older_than(days: int) -> int:
+    """Delete rows older than `days`. days <= 0 means keep forever. Returns row count deleted."""
+    if days <= 0:
+        return 0
+    db_ensure()
+    cutoff = int(time.time()) - days * 86400
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM metrics WHERE ts < ?", (cutoff,))
+        conn.execute("DELETE FROM alert_events WHERE ts < ?", (cutoff,))
+        return cur.rowcount or 0
+
+
+def db_stats() -> dict[str, Any]:
+    """Compact DB stats: row count, time range, file size on disk."""
+    db_ensure()
+    out: dict[str, Any] = {"rows": 0, "first_ts": None, "last_ts": None, "size_bytes": 0}
+    try:
+        out["size_bytes"] = os.path.getsize(DB_PATH)
+    except OSError:
+        pass
+    with db_connect(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MIN(ts) AS mn, MAX(ts) AS mx FROM metrics"
+        ).fetchone()
+        if row:
+            out["rows"] = row["n"]
+            out["first_ts"] = row["mn"]
+            out["last_ts"] = row["mx"]
+    return out
+
+
+def migrate_csv_to_db() -> int:
+    """Import legacy CSVs (current power_log.csv + log_archive/**) into the DB.
+
+    Idempotent thanks to INSERT OR IGNORE on the primary key (ts).
+    Returns the count of rows inserted.
+    """
+    db_ensure()
+    candidates: list[str] = []
+    if os.path.exists(LOG_FILE_CSV):
+        candidates.append(LOG_FILE_CSV)
+    if os.path.isdir(ARCHIVE_DIR):
+        for root, _dirs, files in os.walk(ARCHIVE_DIR):
+            for name in files:
+                if name.endswith(".csv"):
+                    candidates.append(os.path.join(root, name))
+
+    inserted = 0
+    sql = """
+        INSERT OR IGNORE INTO metrics (
+            ts, cpu_load, temperature, ram_usage, disk_usage,
+            net_sent_total_mb, net_recv_total_mb,
+            net_sent_delta_mb, net_recv_delta_mb,
+            load_avg_1m, power_w, interval_wh
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    with db_connect() as conn:
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    batch: list[tuple] = []
+                    for row in reader:
+                        ts_str = row.get("Timestamp")
+                        if not ts_str:
+                            continue
+                        try:
+                            ts = int(dt.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S").timestamp())
+                        except ValueError:
+                            continue
+                        def num(key: str) -> float | None:
+                            v = row.get(key)
+                            if v in (None, "", "N/A"):
+                                return None
+                            try:
+                                return float(v)
+                            except ValueError:
+                                return None
+                        batch.append((
+                            ts,
+                            num("CPU Load (%)") or 0.0,
+                            num("Temperature (C)") if "Temperature (C)" in row else num("Temperature (°C)"),
+                            num("RAM Usage (%)") or 0.0,
+                            num("Disk Usage (%)") or 0.0,
+                            num("Net Sent Total (MB)") if "Net Sent Total (MB)" in row else num("Network Sent (MB)"),
+                            num("Net Recv Total (MB)") if "Net Recv Total (MB)" in row else num("Network Received (MB)"),
+                            num("Net Sent Delta (MB)"),
+                            num("Net Recv Delta (MB)"),
+                            num("Load Avg 1m"),
+                            num("Estimated Power (W)") or 0.0,
+                            num("Interval Wh") or 0.0,
+                        ))
+                    if batch:
+                        cur = conn.executemany(sql, batch)
+                        inserted += cur.rowcount or 0
+            except OSError:
+                continue
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# CSV helpers (legacy / migration only)
 # ---------------------------------------------------------------------------
 
 def _read_last_lines(path: str, n: int = 1, block_size: int = 4096) -> list[str]:

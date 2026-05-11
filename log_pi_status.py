@@ -1,13 +1,12 @@
-"""Periodic system metrics logger.
+"""Periodic system metrics logger (SQLite-backed).
 
-Designed to be invoked by cron (e.g. every minute). Writes one CSV row per
-invocation, archives the previous day's logs on date rollover, and emits
-edge-triggered Telegram alerts (with per-metric cooldown + recovery message).
+Designed to be invoked by cron (e.g. every minute). Writes one row to the
+metrics table per invocation, fires edge-triggered Telegram alerts (with
+per-metric cooldown + recovery message), and applies retention.
 """
 
 from __future__ import annotations
 
-import csv
 import datetime as dt
 import os
 from typing import Any
@@ -46,11 +45,9 @@ def _telegram_send(text: str) -> None:
 
 
 def _check_alerts(metrics: sm.Metrics, state: dict[str, Any]) -> None:
-    """Edge-triggered alerts with cooldown & recovery messages.
+    """Edge-triggered alerts with cooldown + recovery messages.
 
-    state["alerts"] = {
-        "<metric>": {"active": bool, "last_sent": iso-timestamp},
-    }
+    Each fired alert is also recorded in the alert_events table for history.
     """
     cfg_alerts = CONFIG.get("alerts", {})
     if not cfg_alerts.get("enabled", True):
@@ -80,6 +77,7 @@ def _check_alerts(metrics: sm.Metrics, state: dict[str, Any]) -> None:
 
         if breached and not s["active"]:
             _telegram_send(f"{emoji} *High {label}*: `{value:.2f}{unit}` (> {threshold}{unit})")
+            sm.db_insert_alert(key, "breach", value, threshold)
             s["active"] = True
             s["last_sent"] = now.isoformat()
         elif breached and s["active"]:
@@ -90,55 +88,14 @@ def _check_alerts(metrics: sm.Metrics, state: dict[str, Any]) -> None:
                 last = now - cooldown
             if now - last >= cooldown:
                 _telegram_send(f"{emoji} *Still high — {label}*: `{value:.2f}{unit}`")
+                sm.db_insert_alert(key, "continued", value, threshold)
                 s["last_sent"] = now.isoformat()
         elif (not breached) and s["active"]:
             s["active"] = False
             s["last_sent"] = now.isoformat()
+            sm.db_insert_alert(key, "recovery", value, threshold)
             if send_recovery:
                 _telegram_send(f"✅ *Recovered — {label}*: `{value:.2f}{unit}` (≤ {threshold}{unit})")
-
-
-# ---------------------------------------------------------------------------
-# Archiving
-# ---------------------------------------------------------------------------
-
-def _archive_if_rolled_over() -> None:
-    """If the current CSV's last entry is from before today, move it to archive."""
-    if not (os.path.exists(sm.LOG_FILE_CSV) and os.path.getsize(sm.LOG_FILE_CSV) > 0):
-        return
-
-    last = sm.get_last_csv_entry(sm.LOG_FILE_CSV)
-    if not last:
-        return
-    try:
-        last_ts = dt.datetime.strptime(last["Timestamp"], "%Y-%m-%d %H:%M:%S")
-    except (KeyError, ValueError):
-        # Corrupt header/timestamp — fall back to file mtime
-        last_ts = dt.datetime.fromtimestamp(os.path.getmtime(sm.LOG_FILE_CSV))
-
-    today = dt.date.today()
-    if last_ts.date() >= today:
-        return  # still today, no archive
-
-    archive_date = last_ts.date()
-    archive_dir = os.path.join(
-        sm.ARCHIVE_DIR,
-        f"{archive_date.year}",
-        f"{archive_date.strftime('%b')}_{archive_date.month:02d}",
-    )
-    os.makedirs(archive_dir, exist_ok=True)
-    archive_name = f"{archive_date.day}_{archive_date.strftime('%A')}.csv"
-    archive_path = os.path.join(archive_dir, archive_name)
-
-    if os.path.exists(archive_path):
-        i = 1
-        base, ext = os.path.splitext(archive_path)
-        while os.path.exists(f"{base}_{i}{ext}"):
-            i += 1
-        archive_path = f"{base}_{i}{ext}"
-
-    os.rename(sm.LOG_FILE_CSV, archive_path)
-    logger.info("Archived %s -> %s", sm.LOG_FILE_CSV, archive_path)
 
 
 # ---------------------------------------------------------------------------
@@ -146,45 +103,32 @@ def _archive_if_rolled_over() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    os.makedirs(sm.LOG_DIR, exist_ok=True)
-
-    _archive_if_rolled_over()
+    auto_migrate = bool(CONFIG.get("storage", {}).get("auto_migrate_csv", True))
+    sm.db_init(auto_migrate=auto_migrate)
 
     state = sm.load_state()
-
-    # Net deltas: use stored cumulative bytes (since boot) to compute interval
     metrics = sm.collect_metrics(CONFIG.get("power_model", {}), blocking=True)
 
+    # Net delta vs. previous run, with reboot-counter-reset handling
     prev = state.get("last", {})
     prev_sent = float(prev.get("net_sent_mb", metrics.net_sent_mb))
     prev_recv = float(prev.get("net_recv_mb", metrics.net_recv_mb))
-    # Handle counter reset across reboots
-    delta_sent = max(0.0, metrics.net_sent_mb - prev_sent)
-    delta_recv = max(0.0, metrics.net_recv_mb - prev_recv)
-    metrics.net_sent_delta_mb = delta_sent
-    metrics.net_recv_delta_mb = delta_recv
+    metrics.net_sent_delta_mb = max(0.0, metrics.net_sent_mb - prev_sent)
+    metrics.net_recv_delta_mb = max(0.0, metrics.net_recv_mb - prev_recv)
 
-    # Compute interval Wh from elapsed wall-clock since last run
+    # Interval Wh from elapsed wall-clock since previous run
     last_ts_str = prev.get("timestamp")
+    elapsed_hours = 0.0
     if last_ts_str:
         try:
             last_ts = dt.datetime.fromisoformat(last_ts_str)
             elapsed_hours = max(0.0, (metrics.timestamp - last_ts).total_seconds() / 3600)
         except ValueError:
-            elapsed_hours = 0.0
-    else:
-        elapsed_hours = 0.0
-    interval_wh = metrics.power_estimation * elapsed_hours if elapsed_hours < 1 else 0.0
+            pass
+    interval_wh = metrics.power_estimation * elapsed_hours if 0 < elapsed_hours < 1 else 0.0
 
-    # Write CSV row
-    new_file = not (os.path.exists(sm.LOG_FILE_CSV) and os.path.getsize(sm.LOG_FILE_CSV) > 0)
-    with open(sm.LOG_FILE_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if new_file:
-            w.writerow(sm.CSV_HEADER)
-        w.writerow(metrics.as_row(interval_wh))
+    sm.db_insert_metric(metrics, interval_wh)
 
-    # Persist state
     state["last"] = {
         "timestamp": metrics.timestamp.isoformat(),
         "net_sent_mb": metrics.net_sent_mb,
@@ -193,6 +137,19 @@ def main() -> None:
 
     _check_alerts(metrics, state)
     sm.save_state(state)
+
+    # Retention
+    retention = int(CONFIG.get("storage", {}).get("retention_days", 365))
+    if retention > 0:
+        # Run prune at most once a day to avoid pointless writes
+        last_prune = state.get("last_prune_date")
+        today = dt.date.today().isoformat()
+        if last_prune != today:
+            removed = sm.db_purge_older_than(retention)
+            state["last_prune_date"] = today
+            sm.save_state(state)
+            if removed:
+                logger.info("Pruned %d rows older than %d days", removed, retention)
 
     logger.debug(
         "logged cpu=%.1f temp=%s ram=%.1f disk=%.1f power=%.2f wh=%.4f",

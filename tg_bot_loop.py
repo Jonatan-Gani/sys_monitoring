@@ -11,6 +11,8 @@ Goals:
 
 from __future__ import annotations
 
+import datetime as dt
+import io
 import math
 import os
 import signal
@@ -309,31 +311,30 @@ def render_net() -> str:
 
 
 def render_summary(window_hours: int) -> str:
-    # ~1 row/minute assumed; over-read a bit and filter by timestamp
-    rows = sm.read_csv_tail(n=max(60, window_hours * 60 + 10))
-    cutoff = datetime.now() - timedelta(hours=window_hours)
-    filtered = []
-    for row in rows:
-        try:
-            ts = datetime.strptime(row.get("Timestamp", ""), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        if ts >= cutoff:
-            filtered.append(row)
-
-    if not filtered:
+    """SQL-aggregated summary — fast regardless of window length."""
+    since = int(time.time()) - window_hours * 3600
+    s = sm.db_summarize_window(since)
+    if not s.get("n"):
         return f"_No data points in the last {window_hours}h._"
 
-    s = sm.summarize_rows(filtered)
-    lines = [f"*Summary · last {window_hours}h* ({s['count']} samples)"]
-    pretty = {"cpu": "CPU%", "temp": "Temp°C", "ram": "RAM%", "disk": "Disk%", "power": "Power W"}
+    lines = [f"*Summary · last {window_hours}h* ({s['n']} samples)"]
     rows_out = [f"{'METRIC':<8} {'MIN':>7} {'AVG':>7} {'MAX':>7}"]
-    for short, label in pretty.items():
-        if short in s:
-            v = s[short]
-            rows_out.append(f"{label:<8} {v['min']:>7.2f} {v['avg']:>7.2f} {v['max']:>7.2f}")
+    metric_map = [
+        ("CPU%",   "cpu_min", "cpu_avg", "cpu_max"),
+        ("Temp°C", "temp_min", "temp_avg", "temp_max"),
+        ("RAM%",   "ram_min", "ram_avg", "ram_max"),
+        ("Disk%",  "disk_min", "disk_avg", "disk_max"),
+        ("Power W","pow_min", "pow_avg", "pow_max"),
+    ]
+    for label, kmin, kavg, kmax in metric_map:
+        if s.get(kmin) is None:
+            continue
+        rows_out.append(f"{label:<8} {s[kmin]:>7.2f} {s[kavg]:>7.2f} {s[kmax]:>7.2f}")
     lines.append(code_block("\n".join(rows_out)))
-    lines.append(f"⚡ Energy used: `{s['interval_wh_total']:.2f} Wh`")
+    lines.append(
+        f"⚡ Energy: `{s['energy_wh']:.2f} Wh`   "
+        f"🌐 Net: ↑`{s['net_sent_mb']:.1f} MB`  ↓`{s['net_recv_mb']:.1f} MB`"
+    )
     return "\n".join(lines)
 
 
@@ -362,40 +363,36 @@ def render_settings() -> tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Archive browser
+# Archive browser (DB-backed)
 # ---------------------------------------------------------------------------
 
+_MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _dates_grouped() -> dict[str, dict[str, list[str]]]:
+    """{year: {month_num: [day, ...]}}, sorted descending by year/month, ascending by day."""
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for date_iso in sm.db_available_dates():
+        try:
+            y, m, d = date_iso.split("-")
+        except ValueError:
+            continue
+        grouped.setdefault(y, {}).setdefault(m, []).append(d)
+    return grouped
+
+
 def get_available_years() -> list[str]:
-    if not os.path.exists(sm.ARCHIVE_DIR):
-        return []
-    return sorted([d for d in os.listdir(sm.ARCHIVE_DIR) if d.isdigit()])
+    return sorted(_dates_grouped().keys(), reverse=True)
 
 
 def get_available_months(year: str) -> list[str]:
-    p = os.path.join(sm.ARCHIVE_DIR, year)
-    if not os.path.isdir(p):
-        return []
-    months = []
-    for folder in sorted(os.listdir(p)):
-        if os.path.isdir(os.path.join(p, folder)) and "_" in folder:
-            name, num = folder.split("_", 1)
-            months.append(f"{name}\t{num.zfill(2)}")
-    return months
+    g = _dates_grouped().get(year, {})
+    return sorted(g.keys())
 
 
-def get_available_days(year: str, month_folder: str) -> list[tuple[str, str]]:
-    p = os.path.join(sm.ARCHIVE_DIR, year, month_folder)
-    if not os.path.isdir(p):
-        return []
-    out: list[tuple[str, str]] = []
-    for name in os.listdir(p):
-        if name.endswith(".csv"):
-            stem = name[:-4]
-            if "_" in stem:
-                day, weekday = stem.split("_", 1)
-                out.append((day.zfill(2), weekday))
-    out.sort(key=lambda x: int(x[0]))
-    return out
+def get_available_days(year: str, month: str) -> list[str]:
+    return sorted(_dates_grouped().get(year, {}).get(month, []))
 
 
 def pagination_keyboard(items: list[dict], page: int, prefix: str,
@@ -443,12 +440,15 @@ def show_months(chat_id: int, message_id: int | None = None) -> None:
         return
     months = get_available_months(sess.year)
     if not months:
-        edit_message(chat_id, message_id or 0, f"_No months for {sess.year}._")
+        edit_message(chat_id, message_id or 0, f"_No data for {sess.year}._")
         return
     sess.stage = "month"
     items = []
-    for entry in months:
-        name, num = entry.split("\t")
+    for num in months:
+        try:
+            name = _MONTH_ABBR[int(num) - 1]
+        except (ValueError, IndexError):
+            name = num
         items.append({"text": f"{name} ({num})", "callback_data": f"month:{num}"})
     keyboard = pagination_keyboard(items, sess.page, "month",
                                    extra_rows=[[{"text": "⬅️ Back", "callback_data": "view:logs"}]])
@@ -469,16 +469,37 @@ def show_days(chat_id: int, message_id: int | None = None) -> None:
         edit_message(chat_id, message_id or 0, "_No days available._")
         return
     sess.stage = "day"
-    items = [{"text": f"{wd} {day}", "callback_data": f"day:{day}:{wd}"} for day, wd in days]
+    items = []
+    for day in days:
+        try:
+            d = dt.date(int(sess.year), int(sess.month), int(day))
+            label = f"{d.strftime('%a')} {day}"
+        except ValueError:
+            label = day
+        items.append({"text": label, "callback_data": f"day:{day}"})
     keyboard = pagination_keyboard(
         items, sess.page, "day",
-        extra_rows=[[{"text": "⬅️ Back", "callback_data": f"back:month"}]],
+        extra_rows=[[{"text": "⬅️ Back", "callback_data": "back:month"}]],
     )
-    msg = f"*Logs · {sess.year}/{sess.month} · select day*"
+    msg = f"*Logs · {sess.year}-{sess.month} · select day*"
     if message_id:
         edit_message(chat_id, message_id, msg, keyboard)
     else:
         send_message(chat_id, msg, keyboard)
+
+
+def send_csv_for_date(chat_id: int, date_iso: str, caption: str | None = None) -> bool:
+    """Export DB rows for the given local date as CSV and send as a document."""
+    data = sm.db_export_csv_for_date(date_iso)
+    if not data:
+        send_message(chat_id, f"_No data for {date_iso}._")
+        return False
+    payload: dict[str, Any] = {"chat_id": chat_id}
+    if caption:
+        payload["caption"] = caption
+    files = {"document": (f"sysmon_{date_iso}.csv", io.BytesIO(data.encode("utf-8")), "text/csv")}
+    _post("sendDocument", payload, files=files)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -507,9 +528,11 @@ def cmd_help(chat_id: int, _args: str) -> None:
         "`/disks`  per-partition usage\n"
         "`/service <unit>`  systemd status\n\n"
         "History:\n"
-        "`/summary [24|72|168]`  last N hours stats\n"
-        "`/latest`  most recent CSV\n"
-        "`/getlog`  browse archives\n\n"
+        "`/summary [24|72|168]`  last N hours stats (SQL-aggregated)\n"
+        "`/latest`  today's metrics as CSV\n"
+        "`/export YYYY-MM-DD`  export a specific day\n"
+        "`/getlog`  browse stored days\n"
+        "`/db`  database stats\n\n"
         "Control:\n"
         "`/alerts on|off|status`\n"
         "`/threshold <name> <value>`\n"
@@ -588,10 +611,27 @@ def cmd_service(chat_id: int, args: str) -> None:
 
 
 def cmd_latest(chat_id: int, _args: str) -> None:
-    if os.path.exists(sm.LOG_FILE_CSV):
-        send_document(chat_id, sm.LOG_FILE_CSV, caption="Latest power log")
-    else:
-        send_message(chat_id, "_No current log file yet._")
+    """Send today's data as a CSV exported from the DB."""
+    today_iso = dt.date.today().isoformat()
+    sent = send_csv_for_date(chat_id, today_iso, caption=f"Today's metrics · {today_iso}")
+    if not sent:
+        # Fallback: send yesterday if today is empty (e.g. early-morning request)
+        yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        send_csv_for_date(chat_id, yesterday, caption=f"Yesterday's metrics · {yesterday}")
+
+
+def cmd_export(chat_id: int, args: str) -> None:
+    """`/export YYYY-MM-DD` — export a specific day as CSV."""
+    date_iso = args.strip()
+    if not date_iso:
+        send_message(chat_id, "_Usage: `/export YYYY-MM-DD`_")
+        return
+    try:
+        dt.datetime.strptime(date_iso, "%Y-%m-%d")
+    except ValueError:
+        send_message(chat_id, "_Date must be YYYY-MM-DD._")
+        return
+    send_csv_for_date(chat_id, date_iso, caption=f"Metrics · {date_iso}")
 
 
 def cmd_summary(chat_id: int, args: str) -> None:
@@ -650,6 +690,22 @@ def cmd_getlog(chat_id: int, _args: str) -> None:
     show_years(chat_id)
 
 
+def cmd_db(chat_id: int, _args: str) -> None:
+    s = sm.db_stats()
+    size_mb = s["size_bytes"] / (1024 * 1024)
+    first = dt.datetime.fromtimestamp(s["first_ts"]).strftime("%Y-%m-%d %H:%M") if s["first_ts"] else "—"
+    last = dt.datetime.fromtimestamp(s["last_ts"]).strftime("%Y-%m-%d %H:%M") if s["last_ts"] else "—"
+    text = (
+        "*Database*\n"
+        f"Rows: `{s['rows']:,}`\n"
+        f"Size: `{size_mb:.2f} MB`\n"
+        f"From: `{first}`\n"
+        f"To:   `{last}`\n"
+        f"Path: `{os.path.relpath(sm.DB_PATH)}`"
+    )
+    send_message(chat_id, text)
+
+
 COMMANDS: dict[str, Callable[[int, str], None]] = {
     "/start": cmd_start,
     "/menu": cmd_start,
@@ -670,10 +726,12 @@ COMMANDS: dict[str, Callable[[int, str], None]] = {
     "/service": cmd_service,
     "/services": cmd_service,
     "/latest": cmd_latest,
+    "/export": cmd_export,
     "/summary": cmd_summary,
     "/alerts": cmd_alerts,
     "/threshold": cmd_threshold,
     "/getlog": cmd_getlog,
+    "/db": cmd_db,
 }
 
 
@@ -789,31 +847,20 @@ def handle_callback(cb: dict) -> None:
         return
 
     if data.startswith("month:"):
-        num = data.split(":", 1)[1]
-        months = get_available_months(sess.year or "")
-        match = [m for m in months if m.endswith(f"\t{num}")]
-        if not match:
-            edit_message(chat_id, message_id, "_Month not found._")
-            return
-        name = match[0].split("\t")[0]
-        sess.month = f"{name}_{num}"
+        sess.month = data.split(":", 1)[1]
         sess.page = 0
         show_days(chat_id, message_id)
         return
 
     if data.startswith("day:"):
-        _, day, weekday = data.split(":", 2)
-        log_path = os.path.join(
-            sm.ARCHIVE_DIR, sess.year or "", sess.month or "",
-            f"{int(day)}_{weekday}.csv",
-        )
-        if not os.path.exists(log_path):
-            edit_message(chat_id, message_id, f"_Log not found:_ `{os.path.basename(log_path)}`")
+        day = data.split(":", 1)[1]
+        if not (sess.year and sess.month):
+            edit_message(chat_id, message_id, "_Pick a year/month first._")
             return
-        send_document(chat_id, log_path, caption=f"{sess.year}/{sess.month}/{day} ({weekday})")
-        # Offer back to status
+        date_iso = f"{sess.year}-{sess.month}-{day}"
+        sent = send_csv_for_date(chat_id, date_iso, caption=f"Metrics · {date_iso}")
         kb = {"inline_keyboard": [[{"text": "⬅️ Back to status", "callback_data": "view:status"}]]}
-        edit_message(chat_id, message_id, "✅ Log sent.", kb)
+        edit_message(chat_id, message_id, "✅ Log sent." if sent else f"_No data for {date_iso}._", kb)
         return
 
 
@@ -866,9 +913,13 @@ def _load_offset() -> int | None:
 
 
 def poll_loop() -> None:
+    sm.db_init(auto_migrate=bool(CONFIG.get("storage", {}).get("auto_migrate_csv", True)))
     offset = _load_offset()
-    logger.info("Bot starting · authorized users=%d · poll_timeout=%ds",
-                len(AUTHORIZED_USERS), POLL_TIMEOUT)
+    stats = sm.db_stats()
+    logger.info(
+        "Bot starting · users=%d · poll_timeout=%ds · db_rows=%d",
+        len(AUTHORIZED_USERS), POLL_TIMEOUT, stats["rows"],
+    )
     backoff = 1.0
     while True:
         try:
