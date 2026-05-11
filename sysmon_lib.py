@@ -95,7 +95,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
 }
 
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics (
     ts                INTEGER PRIMARY KEY,
@@ -109,7 +109,23 @@ CREATE TABLE IF NOT EXISTS metrics (
     net_recv_delta_mb REAL,
     load_avg_1m       REAL,
     power_w           REAL NOT NULL,
-    interval_wh       REAL
+    interval_wh       REAL,
+    -- v2 columns (NULL on rows written before the migration)
+    cpu_user          REAL,
+    cpu_system        REAL,
+    cpu_iowait        REAL,
+    cpu_steal         REAL,
+    load_avg_5m       REAL,
+    load_avg_15m      REAL,
+    mem_available_mb  REAL,
+    mem_cached_mb     REAL,
+    mem_buffers_mb    REAL,
+    swap_used_mb      REAL,
+    disk_read_mb_s    REAL,
+    disk_write_mb_s   REAL,
+    procs_total       INTEGER,
+    procs_running     INTEGER,
+    open_fds          INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(ts);
 
@@ -128,6 +144,31 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT
 );
 """
+
+_V2_COLUMNS = [
+    ("cpu_user", "REAL"),
+    ("cpu_system", "REAL"),
+    ("cpu_iowait", "REAL"),
+    ("cpu_steal", "REAL"),
+    ("load_avg_5m", "REAL"),
+    ("load_avg_15m", "REAL"),
+    ("mem_available_mb", "REAL"),
+    ("mem_cached_mb", "REAL"),
+    ("mem_buffers_mb", "REAL"),
+    ("swap_used_mb", "REAL"),
+    ("disk_read_mb_s", "REAL"),
+    ("disk_write_mb_s", "REAL"),
+    ("procs_total", "INTEGER"),
+    ("procs_running", "INTEGER"),
+    ("open_fds", "INTEGER"),
+]
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(metrics)")}
+    for col, typ in _V2_COLUMNS:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE metrics ADD COLUMN {col} {typ}")
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +290,22 @@ class Metrics:
     load_avg_1m: float
     power_estimation: float
     uptime_seconds: float
+    # v2 fields
+    cpu_user: float = 0.0
+    cpu_system: float = 0.0
+    cpu_iowait: float = 0.0
+    cpu_steal: float = 0.0
+    load_avg_5m: float = 0.0
+    load_avg_15m: float = 0.0
+    mem_available_mb: float = 0.0
+    mem_cached_mb: float = 0.0
+    mem_buffers_mb: float = 0.0
+    swap_used_mb: float = 0.0
+    disk_read_mb_s: float = 0.0
+    disk_write_mb_s: float = 0.0
+    procs_total: int = 0
+    procs_running: int = 0
+    open_fds: int | None = None
 
     def as_row(self, interval_wh: float) -> list[str]:
         return [
@@ -312,17 +369,22 @@ def collect_metrics(power_model: dict[str, float], blocking: bool = False) -> Me
     """
     interval = 0.5 if blocking else None
     cpu_load = psutil.cpu_percent(interval=interval)
+    cpu_times = psutil.cpu_times_percent(interval=None)
     temperature = read_cpu_temperature()
-    ram_usage = psutil.virtual_memory().percent
+
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    ram_usage = vm.percent
     disk_usage = psutil.disk_usage("/").percent
+
     net = psutil.net_io_counters()
     net_sent_mb = net.bytes_sent / (1024 * 1024)
     net_recv_mb = net.bytes_recv / (1024 * 1024)
 
     try:
-        load1 = os.getloadavg()[0]
+        load1, load5, load15 = os.getloadavg()
     except OSError:
-        load1 = 0.0
+        load1 = load5 = load15 = 0.0
 
     idle = power_model.get("idle_watts", 4.5)
     load_w = power_model.get("load_watts", 7.5)
@@ -332,6 +394,23 @@ def collect_metrics(power_model: dict[str, float], blocking: bool = False) -> Me
         uptime = time.time() - psutil.boot_time()
     except Exception:
         uptime = 0.0
+
+    # Process counts (cheap — single iteration).
+    procs_total = 0
+    procs_running = 0
+    for p in psutil.process_iter(attrs=["status"]):
+        procs_total += 1
+        if p.info.get("status") == psutil.STATUS_RUNNING:
+            procs_running += 1
+
+    # Open FDs only on POSIX.
+    open_fds: int | None = None
+    if not IS_WINDOWS:
+        try:
+            with open("/proc/sys/fs/file-nr", "r", encoding="utf-8") as f:
+                open_fds = int(f.read().split()[0])
+        except (OSError, ValueError):
+            open_fds = None
 
     return Metrics(
         timestamp=dt.datetime.now(),
@@ -346,7 +425,34 @@ def collect_metrics(power_model: dict[str, float], blocking: bool = False) -> Me
         load_avg_1m=load1,
         power_estimation=power_estimation,
         uptime_seconds=uptime,
+        cpu_user=getattr(cpu_times, "user", 0.0),
+        cpu_system=getattr(cpu_times, "system", 0.0),
+        cpu_iowait=getattr(cpu_times, "iowait", 0.0),
+        cpu_steal=getattr(cpu_times, "steal", 0.0),
+        load_avg_5m=load5,
+        load_avg_15m=load15,
+        mem_available_mb=vm.available / (1024 * 1024),
+        mem_cached_mb=getattr(vm, "cached", 0) / (1024 * 1024),
+        mem_buffers_mb=getattr(vm, "buffers", 0) / (1024 * 1024),
+        swap_used_mb=swap.used / (1024 * 1024),
+        # Disk IO rates filled in by log_pi_status, which has the previous-snapshot state.
+        disk_read_mb_s=0.0,
+        disk_write_mb_s=0.0,
+        procs_total=procs_total,
+        procs_running=procs_running,
+        open_fds=open_fds,
     )
+
+
+def disk_io_totals() -> tuple[float, float]:
+    """Return (cumulative read MB, cumulative write MB) across all disks."""
+    try:
+        io = psutil.disk_io_counters(perdisk=False)
+    except Exception:
+        return (0.0, 0.0)
+    if io is None:
+        return (0.0, 0.0)
+    return (io.read_bytes / (1024 * 1024), io.write_bytes / (1024 * 1024))
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +665,7 @@ def _get_db_version(conn: sqlite3.Connection) -> int:
 # Add new entries here in future releases; do not edit historical ones.
 _MIGRATIONS: dict[int, "callable"] = {
     # 1: initial schema — handled by DB_SCHEMA itself
+    2: _migrate_v2,
 }
 
 
@@ -632,14 +739,25 @@ def db_insert_metric(m: "Metrics", interval_wh: float) -> None:
                 ts, cpu_load, temperature, ram_usage, disk_usage,
                 net_sent_total_mb, net_recv_total_mb,
                 net_sent_delta_mb, net_recv_delta_mb,
-                load_avg_1m, power_w, interval_wh
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                load_avg_1m, power_w, interval_wh,
+                cpu_user, cpu_system, cpu_iowait, cpu_steal,
+                load_avg_5m, load_avg_15m,
+                mem_available_mb, mem_cached_mb, mem_buffers_mb, swap_used_mb,
+                disk_read_mb_s, disk_write_mb_s,
+                procs_total, procs_running, open_fds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 ts, m.cpu_load, m.temperature, m.ram_usage, m.disk_usage,
                 m.net_sent_mb, m.net_recv_mb,
                 m.net_sent_delta_mb, m.net_recv_delta_mb,
                 m.load_avg_1m, m.power_estimation, interval_wh,
+                m.cpu_user, m.cpu_system, m.cpu_iowait, m.cpu_steal,
+                m.load_avg_5m, m.load_avg_15m,
+                m.mem_available_mb, m.mem_cached_mb, m.mem_buffers_mb, m.swap_used_mb,
+                m.disk_read_mb_s, m.disk_write_mb_s,
+                m.procs_total, m.procs_running, m.open_fds,
             ),
         )
 
@@ -727,27 +845,52 @@ def db_export_csv_for_date(date_iso: str) -> str | None:
     import io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([
+    header = [
         "Timestamp", "CPU Load (%)", "Temperature (C)", "RAM Usage (%)",
         "Disk Usage (%)", "Net Sent Total (MB)", "Net Recv Total (MB)",
         "Net Sent Delta (MB)", "Net Recv Delta (MB)",
         "Load Avg 1m", "Estimated Power (W)", "Interval Wh",
-    ])
+        "CPU User (%)", "CPU System (%)", "CPU IOWait (%)", "CPU Steal (%)",
+        "Load Avg 5m", "Load Avg 15m",
+        "Mem Available (MB)", "Mem Cached (MB)", "Mem Buffers (MB)", "Swap Used (MB)",
+        "Disk Read (MB/s)", "Disk Write (MB/s)",
+        "Processes Total", "Processes Running", "Open FDs",
+    ]
+    writer.writerow(header)
+
+    def f(v, fmt=".2f", default="N/A"):
+        return default if v is None else format(v, fmt)
+
     for r in rows:
         ts_str = dt.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M:%S")
         writer.writerow([
             ts_str,
-            f"{r['cpu_load']:.2f}",
-            f"{r['temperature']:.2f}" if r["temperature"] is not None else "N/A",
-            f"{r['ram_usage']:.2f}",
-            f"{r['disk_usage']:.2f}",
-            f"{(r['net_sent_total_mb'] or 0):.2f}",
-            f"{(r['net_recv_total_mb'] or 0):.2f}",
-            f"{(r['net_sent_delta_mb'] or 0):.2f}",
-            f"{(r['net_recv_delta_mb'] or 0):.2f}",
-            f"{(r['load_avg_1m'] or 0):.2f}",
-            f"{r['power_w']:.2f}",
-            f"{(r['interval_wh'] or 0):.4f}",
+            f(r["cpu_load"]),
+            f(r["temperature"]),
+            f(r["ram_usage"]),
+            f(r["disk_usage"]),
+            f(r["net_sent_total_mb"]),
+            f(r["net_recv_total_mb"]),
+            f(r["net_sent_delta_mb"]),
+            f(r["net_recv_delta_mb"]),
+            f(r["load_avg_1m"]),
+            f(r["power_w"]),
+            f(r["interval_wh"], ".4f"),
+            f(r["cpu_user"]),
+            f(r["cpu_system"]),
+            f(r["cpu_iowait"]),
+            f(r["cpu_steal"]),
+            f(r["load_avg_5m"]),
+            f(r["load_avg_15m"]),
+            f(r["mem_available_mb"]),
+            f(r["mem_cached_mb"]),
+            f(r["mem_buffers_mb"]),
+            f(r["swap_used_mb"]),
+            f(r["disk_read_mb_s"]),
+            f(r["disk_write_mb_s"]),
+            f(r["procs_total"], "d"),
+            f(r["procs_running"], "d"),
+            f(r["open_fds"], "d"),
         ])
     return buf.getvalue()
 
@@ -966,6 +1109,70 @@ def format_uptime(seconds: float) -> str:
         parts.append(f"{hours}h")
     parts.append(f"{mins}m")
     return " ".join(parts)
+
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[float], width: int = 30) -> str:
+    """Map a sequence of floats to a fixed-width unicode sparkline.
+
+    Resamples to `width` points and scales between observed min and max.
+    Returns an empty string when given fewer than 2 points.
+    """
+    if not values or len(values) < 2:
+        return ""
+    # Resample to width buckets by averaging
+    n = len(values)
+    if n == width:
+        sampled = list(values)
+    elif n > width:
+        bucket = n / width
+        sampled = []
+        for i in range(width):
+            lo = int(i * bucket)
+            hi = max(lo + 1, int((i + 1) * bucket))
+            chunk = values[lo:hi]
+            sampled.append(sum(chunk) / len(chunk) if chunk else 0.0)
+    else:
+        # Stretch: nearest-neighbor sample to width
+        sampled = [values[int(i * n / width)] for i in range(width)]
+    lo, hi = min(sampled), max(sampled)
+    if hi - lo < 1e-9:
+        return SPARK_CHARS[0] * width
+    return "".join(
+        SPARK_CHARS[
+            min(len(SPARK_CHARS) - 1, int((v - lo) / (hi - lo) * (len(SPARK_CHARS) - 1)))
+        ]
+        for v in sampled
+    )
+
+
+def db_recent_values(column: str, hours: float = 1.0, limit: int = 240) -> list[float]:
+    """Pull a single column's values over the past N hours, oldest first.
+
+    Used by sparklines and /chart. Restricted column name to whitelist to
+    keep this safe.
+    """
+    allowed = {
+        "cpu_load", "temperature", "ram_usage", "disk_usage", "power_w",
+        "load_avg_1m", "load_avg_5m", "load_avg_15m",
+        "cpu_user", "cpu_system", "cpu_iowait",
+        "mem_available_mb", "swap_used_mb",
+        "disk_read_mb_s", "disk_write_mb_s",
+        "net_sent_delta_mb", "net_recv_delta_mb",
+        "procs_total", "procs_running", "open_fds",
+    }
+    if column not in allowed:
+        raise ValueError(f"column {column!r} not allowed")
+    db_ensure()
+    since = int(time.time() - hours * 3600)
+    with db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            f"SELECT {column} FROM metrics WHERE ts >= ? ORDER BY ts ASC LIMIT ?",
+            (since, limit),
+        ).fetchall()
+    return [r[0] for r in rows if r[0] is not None]
 
 
 def status_emoji(value: float, warn: float, danger: float) -> str:

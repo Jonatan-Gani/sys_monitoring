@@ -116,16 +116,25 @@ def main() -> None:
     metrics.net_sent_delta_mb = max(0.0, metrics.net_sent_mb - prev_sent)
     metrics.net_recv_delta_mb = max(0.0, metrics.net_recv_mb - prev_recv)
 
-    # Interval Wh from elapsed wall-clock since previous run
+    # Disk I/O rate (MB/s) from cumulative read/write counters vs. previous run.
+    cur_read_mb, cur_write_mb = sm.disk_io_totals()
+    prev_read = float(prev.get("disk_read_mb", cur_read_mb))
+    prev_write = float(prev.get("disk_write_mb", cur_write_mb))
+
+    # Interval Wh + IO rate both rely on elapsed seconds
     last_ts_str = prev.get("timestamp")
-    elapsed_hours = 0.0
+    elapsed_seconds = 0.0
     if last_ts_str:
         try:
             last_ts = dt.datetime.fromisoformat(last_ts_str)
-            elapsed_hours = max(0.0, (metrics.timestamp - last_ts).total_seconds() / 3600)
+            elapsed_seconds = max(0.0, (metrics.timestamp - last_ts).total_seconds())
         except ValueError:
             pass
+    elapsed_hours = elapsed_seconds / 3600
     interval_wh = metrics.power_estimation * elapsed_hours if 0 < elapsed_hours < 1 else 0.0
+    if 0 < elapsed_seconds < 600:  # ignore stale state (>10 min gap = startup or paused cron)
+        metrics.disk_read_mb_s = max(0.0, (cur_read_mb - prev_read) / elapsed_seconds)
+        metrics.disk_write_mb_s = max(0.0, (cur_write_mb - prev_write) / elapsed_seconds)
 
     sm.db_insert_metric(metrics, interval_wh)
 
@@ -133,6 +142,8 @@ def main() -> None:
         "timestamp": metrics.timestamp.isoformat(),
         "net_sent_mb": metrics.net_sent_mb,
         "net_recv_mb": metrics.net_recv_mb,
+        "disk_read_mb": cur_read_mb,
+        "disk_write_mb": cur_write_mb,
     }
 
     _check_alerts(metrics, state)

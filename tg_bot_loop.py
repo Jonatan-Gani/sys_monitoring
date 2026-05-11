@@ -15,6 +15,8 @@ import datetime as dt
 import io
 import math
 import os
+import re
+import shutil
 import signal
 import sys
 import time
@@ -187,22 +189,31 @@ def _emoji_for(metric: str, value: float) -> str:
 
 
 def render_status_compact() -> tuple[str, dict]:
-    """One-screen summary of current system state."""
+    """One-screen summary of current system state with hour-long sparklines."""
     m = sm.collect_metrics(CONFIG.get("power_model", {}), blocking=False)
     info = sm.system_info()
 
+    def spark(col: str) -> str:
+        try:
+            vals = sm.db_recent_values(col, hours=1.0)
+        except Exception:
+            return ""
+        s = sm.sparkline(vals, width=20)
+        return f" `{s}`" if s else ""
+
     temp_str = f"{m.temperature:.1f}°C" if m.temperature is not None else "n/a"
-    temp_emoji = "🟢"
-    if m.temperature is not None:
-        temp_emoji = _emoji_for("temperature", m.temperature)
+    temp_emoji = _emoji_for("temperature", m.temperature) if m.temperature is not None else "🟢"
 
     lines = [
         f"*{info.get('hostname','host')}* · up {sm.format_uptime(m.uptime_seconds)}",
         "",
-        f"{_emoji_for('cpu_load', m.cpu_load)} CPU `{m.cpu_load:5.1f}%`  load `{m.load_avg_1m:.2f}`",
-        f"{temp_emoji} Temp `{temp_str}`",
-        f"{_emoji_for('ram_usage', m.ram_usage)} RAM `{m.ram_usage:5.1f}%`",
+        f"{_emoji_for('cpu_load', m.cpu_load)} CPU `{m.cpu_load:5.1f}%`{spark('cpu_load')}",
+        f"        load `{m.load_avg_1m:.2f} {m.load_avg_5m:.2f} {m.load_avg_15m:.2f}`",
+        f"{temp_emoji} Temp `{temp_str}`{spark('temperature') if m.temperature is not None else ''}",
+        f"{_emoji_for('ram_usage', m.ram_usage)} RAM `{m.ram_usage:5.1f}%`{spark('ram_usage')}",
         f"{_emoji_for('disk_usage', m.disk_usage)} Disk `{m.disk_usage:5.1f}%` (/)",
+        f"💽 I/O  `↑{m.disk_write_mb_s:5.1f}` `↓{m.disk_read_mb_s:5.1f} MB/s`",
+        f"⚙️  Procs `{m.procs_total}` ({m.procs_running} running)",
         f"⚡ Power `{m.power_estimation:.2f} W`",
     ]
     text = "\n".join(lines)
@@ -523,25 +534,28 @@ def cmd_status(chat_id: int, _args: str) -> None:
 
 def cmd_help(chat_id: int, _args: str) -> None:
     text = (
-        "*sys_monitoring bot*\n\n"
-        "Quick view:\n"
-        "`/status`  one-screen system snapshot\n"
-        "`/menu`    same as /status\n\n"
-        "Live metrics:\n"
-        "`/cpu` `/ram` `/disk` `/temp` `/net` `/uptime`\n"
-        "`/top [cpu|mem]`  top processes\n"
-        "`/disks`  per-partition usage\n"
-        "`/service <unit>`  systemd status\n\n"
-        "History:\n"
-        "`/summary [24|72|168]`  last N hours stats (SQL-aggregated)\n"
-        "`/latest`  today's metrics as CSV\n"
-        "`/export YYYY-MM-DD`  export a specific day\n"
-        "`/getlog`  browse stored days\n"
-        "`/db`  database stats\n\n"
-        "Control:\n"
+        "*sys_monitoring bot* · `/menu` for the inline UI\n\n"
+        "*📊 Snapshot*\n"
+        "`/status` · `/dashboard` (live) · `/health`\n\n"
+        "*🩺 Live metrics*\n"
+        "`/cpu` `/ram` `/disk` `/disks` `/temp` `/net` `/diskio` `/uptime`\n"
+        "`/top [cpu|mem]` · `/listening` · `/conns`\n\n"
+        "*📈 History & charts*\n"
+        "`/summary [hours]` · `/chart <metric> [hours]`\n"
+        "`/latest` · `/export YYYY-MM-DD` · `/getlog` · `/db`\n"
+        "`/alerts_log [N]`\n\n"
+        "*⚙️ System*\n"
+        "`/service <name>` · `/failed`\n"
+        "`/journal <unit> [N]` · `/updates`\n\n"
+        "*🔔 Alerts*\n"
         "`/alerts on|off|status`\n"
         "`/threshold <name> <value>`\n"
-        "`/help`  this message"
+        "`/watch <metric> <op> <value>`  one-shot ad-hoc alert\n"
+        "`/watch list` · `/watch clear <id|all>`\n\n"
+        "*🛠️ Maintenance*\n"
+        "`/logs [N]` · `/dbbackup` · `/restart`\n\n"
+        "_Chart metrics:_ `cpu ram disk temp load load5 load15 power "
+        "read write sent recv procs swap available`"
     )
     send_message(chat_id, text)
 
@@ -688,6 +702,508 @@ def cmd_threshold(chat_id: int, args: str) -> None:
     send_message(chat_id, f"✅ `{name}` updated  `{old}` → `{value}`")
 
 
+# ---------------------------------------------------------------------------
+# Operational views (v2)
+# ---------------------------------------------------------------------------
+
+_CHART_METRICS = {
+    "cpu": ("cpu_load", "CPU %"),
+    "ram": ("ram_usage", "RAM %"),
+    "disk": ("disk_usage", "Disk %"),
+    "temp": ("temperature", "Temp °C"),
+    "load": ("load_avg_1m", "Load 1m"),
+    "load5": ("load_avg_5m", "Load 5m"),
+    "load15": ("load_avg_15m", "Load 15m"),
+    "power": ("power_w", "Power W"),
+    "read": ("disk_read_mb_s", "Disk read MB/s"),
+    "write": ("disk_write_mb_s", "Disk write MB/s"),
+    "sent": ("net_sent_delta_mb", "Net sent MB/min"),
+    "recv": ("net_recv_delta_mb", "Net recv MB/min"),
+    "procs": ("procs_total", "Processes"),
+    "swap": ("swap_used_mb", "Swap MB"),
+    "available": ("mem_available_mb", "Mem available MB"),
+}
+
+
+def cmd_chart(chat_id: int, args: str) -> None:
+    parts = args.strip().split()
+    if not parts:
+        keys = "  ".join(sorted(_CHART_METRICS))
+        send_message(chat_id, f"_Usage: `/chart <metric> [hours]`_\nMetrics: `{keys}`")
+        return
+    key = parts[0].lower()
+    if key not in _CHART_METRICS:
+        send_message(chat_id, f"_Unknown metric `{md_escape(key)}`._")
+        return
+    hours = 1.0
+    if len(parts) > 1:
+        try:
+            hours = max(0.1, min(720.0, float(parts[1])))
+        except ValueError:
+            send_message(chat_id, "_Hours must be numeric._")
+            return
+    column, label = _CHART_METRICS[key]
+    vals = sm.db_recent_values(column, hours=hours, limit=2000)
+    if not vals:
+        send_message(chat_id, f"_No data for {label} in the last {hours}h._")
+        return
+    spark = sm.sparkline(vals, width=30)
+    text = (
+        f"*{label}* · last {hours:g}h · {len(vals)} samples\n"
+        f"`{spark}`\n"
+        f"min `{min(vals):.2f}`   avg `{sum(vals)/len(vals):.2f}`   max `{max(vals):.2f}`"
+    )
+    send_message(chat_id, text)
+
+
+def cmd_diskio(chat_id: int, _args: str) -> None:
+    last = sm.db_last_metric() or {}
+    read = last.get("disk_read_mb_s") or 0.0
+    write = last.get("disk_write_mb_s") or 0.0
+    lines = [
+        "*Disk I/O*",
+        f"Read  `{read:6.2f} MB/s`",
+        f"Write `{write:6.2f} MB/s`",
+    ]
+    try:
+        per = psutil.disk_io_counters(perdisk=True)
+        if per:
+            lines.append("")
+            lines.append("*Cumulative since boot*")
+            for name, io in per.items():
+                lines.append(
+                    f"`{name:<10}` ↓{sm.format_bytes(io.read_bytes)} "
+                    f"↑{sm.format_bytes(io.write_bytes)}"
+                )
+    except Exception:
+        pass
+    send_message(chat_id, "\n".join(lines))
+
+
+def cmd_listening(chat_id: int, _args: str) -> None:
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, PermissionError):
+        send_message(chat_id, "_Need elevated privileges to list sockets._")
+        return
+    listeners = [c for c in conns if c.status == "LISTEN"]
+    if not listeners:
+        send_message(chat_id, "_No listening sockets visible (need root for full view)._")
+        return
+    rows = [f"{'PROTO':<5} {'ADDRESS':<22} {'PID':>6}  PROCESS"]
+    seen = set()
+    for c in sorted(listeners, key=lambda x: (x.laddr.port if x.laddr else 0)):
+        addr = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else "?"
+        key = (c.type, addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        proto = "TCP" if c.type == 1 else "UDP"
+        pname = "?"
+        if c.pid:
+            try:
+                pname = psutil.Process(c.pid).name()[:20]
+            except psutil.Error:
+                pname = "?"
+        rows.append(f"{proto:<5} {addr[:22]:<22} {c.pid or 0:>6}  {pname}")
+    send_message(chat_id, "*Listening sockets*\n" + code_block("\n".join(rows[:25])))
+
+
+def cmd_conns(chat_id: int, _args: str) -> None:
+    try:
+        conns = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, PermissionError):
+        send_message(chat_id, "_Need elevated privileges to list connections._")
+        return
+    established = [c for c in conns if c.status == "ESTABLISHED" and c.raddr]
+    if not established:
+        send_message(chat_id, "_No established outbound connections._")
+        return
+    by_host: dict[str, int] = {}
+    for c in established:
+        host = c.raddr.ip if c.raddr else "?"
+        by_host[host] = by_host.get(host, 0) + 1
+    rows = [f"{'COUNT':>5}  REMOTE"]
+    for host, n in sorted(by_host.items(), key=lambda kv: kv[1], reverse=True)[:20]:
+        rows.append(f"{n:>5}  {host}")
+    send_message(chat_id, "*Established connections*\n" + code_block("\n".join(rows)))
+
+
+def cmd_failed(chat_id: int, _args: str) -> None:
+    if sm.IS_WINDOWS:
+        # Windows: list services set to auto but currently stopped
+        if not hasattr(psutil, "win_service_iter"):
+            send_message(chat_id, "_psutil build missing Windows service support._")
+            return
+        bad = []
+        for svc in psutil.win_service_iter():
+            try:
+                d = svc.as_dict()
+                if d.get("start_type") in ("automatic", "auto") and d.get("status") != "running":
+                    bad.append(f"{d.get('name','?')}  ({d.get('status','?')})")
+            except Exception:
+                continue
+        if not bad:
+            send_message(chat_id, "✅ No auto-start services in unexpected state.")
+            return
+        send_message(chat_id, "*Auto-start services not running*\n" + code_block("\n".join(bad[:25])))
+        return
+
+    if not shutil.which("systemctl"):
+        send_message(chat_id, "_systemctl unavailable._")
+        return
+    import subprocess
+    res = subprocess.run(
+        ["systemctl", "--no-legend", "--no-pager", "--state=failed", "list-units"],
+        capture_output=True, text=True, timeout=10,
+    )
+    units = [line.split()[0] for line in res.stdout.splitlines() if line.strip()]
+    if not units:
+        send_message(chat_id, "✅ No failed systemd units.")
+        return
+    send_message(chat_id, "*Failed units*\n" + code_block("\n".join(units[:25])))
+
+
+def cmd_journal(chat_id: int, args: str) -> None:
+    parts = args.strip().split()
+    if not parts:
+        send_message(chat_id, "_Usage: `/journal <unit> [lines]`_")
+        return
+    unit = parts[0]
+    if not re.match(r"^[A-Za-z0-9@:._\-]+$", unit):
+        send_message(chat_id, "_Invalid unit name._")
+        return
+    n = 30
+    if len(parts) > 1:
+        try:
+            n = max(1, min(200, int(parts[1])))
+        except ValueError:
+            pass
+    if not shutil.which("journalctl"):
+        send_message(chat_id, "_journalctl unavailable (Linux only)._")
+        return
+    import subprocess
+    res = subprocess.run(
+        ["journalctl", "-u", unit, "-n", str(n), "--no-pager", "--output=short"],
+        capture_output=True, text=True, timeout=15,
+    )
+    output = res.stdout.strip() or res.stderr.strip() or "(empty)"
+    # Telegram message cap ~4096 chars
+    if len(output) > 3800:
+        output = output[-3800:]
+    send_message(chat_id, f"*journalctl {md_escape(unit)} -n {n}*\n" + code_block(output))
+
+
+def cmd_updates(chat_id: int, _args: str) -> None:
+    if sm.IS_WINDOWS:
+        send_message(chat_id, "_/updates not implemented on Windows._")
+        return
+    import subprocess
+    if shutil.which("apt"):
+        res = subprocess.run(
+            ["apt", "list", "--upgradable"],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+        lines = [ln for ln in res.stdout.splitlines() if "/" in ln and "upgradable" in ln]
+        count = len(lines)
+        if count == 0:
+            send_message(chat_id, "✅ All packages up to date (apt).")
+            return
+        sample = "\n".join(ln.split("/")[0] for ln in lines[:15])
+        more = f"\n…and {count - 15} more" if count > 15 else ""
+        send_message(chat_id, f"*{count} updates available*\n" + code_block(sample + more))
+        return
+    if shutil.which("dnf"):
+        res = subprocess.run(["dnf", "check-update", "-q"], capture_output=True, text=True, timeout=30)
+        lines = [ln for ln in res.stdout.splitlines() if ln.strip() and not ln.startswith(" ")]
+        count = len(lines)
+        send_message(chat_id, f"*{count} updates available* (dnf)")
+        return
+    send_message(chat_id, "_No supported package manager (apt/dnf) found._")
+
+
+def cmd_health(chat_id: int, _args: str) -> None:
+    """0-100 score: 100 means all metrics safely under warn line, 0 means at/over danger.
+
+    Worst-offender metric is called out below.
+    """
+    m = sm.collect_metrics(CONFIG.get("power_model", {}), blocking=False)
+    t = _thresholds()
+    components = [
+        ("CPU",  m.cpu_load, t.get("cpu_load", 100)),
+        ("Temp", m.temperature if m.temperature is not None else 0, t.get("temperature", 100)),
+        ("RAM",  m.ram_usage, t.get("ram_usage", 100)),
+        ("Disk", m.disk_usage, t.get("disk_usage", 100)),
+        ("Pwr",  m.power_estimation, t.get("power", 100)),
+    ]
+    scores: list[tuple[str, float, float, float]] = []
+    for name, value, danger in components:
+        warn = danger * 0.85
+        if value <= warn:
+            s = 100.0
+        elif value >= danger:
+            s = 0.0
+        else:
+            s = 100.0 * (1.0 - (value - warn) / (danger - warn))
+        scores.append((name, value, danger, s))
+
+    overall = sum(s for _, _, _, s in scores) / len(scores)
+    worst = min(scores, key=lambda x: x[3])
+    icon = "🟢" if overall >= 80 else ("🟡" if overall >= 50 else "🔴")
+    bars = int(overall / 10)
+    bar = "█" * bars + "░" * (10 - bars)
+
+    lines = [
+        f"*System health* {icon} `{overall:.0f}/100`",
+        f"`{bar}`",
+        "",
+        f"Worst: *{worst[0]}* {worst[1]:.1f} / {worst[2]:.1f} → {worst[3]:.0f}/100",
+        "",
+        "*Breakdown*",
+    ]
+    for name, value, danger, s in scores:
+        lines.append(f"`{name:<5} {value:>7.1f}  /{danger:>6.1f}  → {s:>5.0f}`")
+    send_message(chat_id, "\n".join(lines))
+
+
+def cmd_alerts_log(chat_id: int, args: str) -> None:
+    n = 10
+    try:
+        if args.strip():
+            n = max(1, min(50, int(args.strip())))
+    except ValueError:
+        pass
+    sm.db_ensure()
+    with sm.db_connect(readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT ts, metric, event, value, threshold FROM alert_events "
+            "ORDER BY ts DESC LIMIT ?", (n,),
+        ).fetchall()
+    if not rows:
+        send_message(chat_id, "_No alerts recorded yet._")
+        return
+    out = [f"*Last {len(rows)} alert events*"]
+    for r in rows:
+        when = datetime.fromtimestamp(r["ts"]).strftime("%m-%d %H:%M")
+        icon = {"breach": "⚠️", "recovery": "✅", "continued": "⏳"}.get(r["event"], "•")
+        out.append(f"`{when}` {icon} {r['metric']} {r['event']}: {r['value']:.1f}/{r['threshold']:.1f}")
+    send_message(chat_id, "\n".join(out))
+
+
+# ---------------------------------------------------------------------------
+# /watch — ad-hoc one-shot alerts
+# ---------------------------------------------------------------------------
+
+# In-memory only (cleared on bot restart). Persisted state would require
+# coordinating with the logger process; one-shot ad-hoc semantics fit memory.
+WATCHES: list[dict] = []
+_WATCH_METRICS = {
+    "cpu": "cpu_load", "ram": "ram_usage", "disk": "disk_usage",
+    "temp": "temperature", "power": "power_w", "swap": "swap_used_mb",
+    "load": "load_avg_1m",
+}
+_WATCH_OPS = {">", "<", ">=", "<="}
+
+
+def cmd_watch(chat_id: int, args: str) -> None:
+    parts = args.strip().split()
+    if parts == ["list"]:
+        mine = [w for w in WATCHES if w["chat_id"] == chat_id]
+        if not mine:
+            send_message(chat_id, "_No active watches._")
+            return
+        lines = ["*Active watches*"]
+        for w in mine:
+            lines.append(f"`#{w['id']}` {w['metric']} {w['op']} {w['value']}")
+        send_message(chat_id, "\n".join(lines))
+        return
+    if len(parts) == 2 and parts[0] == "clear":
+        try:
+            wid = int(parts[1])
+        except ValueError:
+            send_message(chat_id, "_Usage: `/watch clear <id>` or `/watch clear all`._")
+            return
+        WATCHES[:] = [w for w in WATCHES if not (w["chat_id"] == chat_id and w["id"] == wid)]
+        send_message(chat_id, f"Removed watch #{wid}.")
+        return
+    if parts == ["clear", "all"] or parts == ["clear"]:
+        WATCHES[:] = [w for w in WATCHES if w["chat_id"] != chat_id]
+        send_message(chat_id, "Cleared all watches.")
+        return
+    if len(parts) != 3:
+        send_message(chat_id,
+            "_Usage:_\n"
+            "`/watch <metric> <op> <value>`  e.g. `/watch cpu > 80`\n"
+            "`/watch list`\n"
+            "`/watch clear <id>` or `/watch clear all`\n"
+            f"Metrics: `{'  '.join(_WATCH_METRICS)}`  Ops: `> < >= <=`")
+        return
+    metric, op, value_str = parts
+    if metric not in _WATCH_METRICS:
+        send_message(chat_id, f"_Unknown metric `{md_escape(metric)}`._")
+        return
+    if op not in _WATCH_OPS:
+        send_message(chat_id, f"_Unknown operator `{md_escape(op)}`._")
+        return
+    try:
+        value = float(value_str)
+    except ValueError:
+        send_message(chat_id, "_Value must be numeric._")
+        return
+    wid = (WATCHES[-1]["id"] + 1) if WATCHES else 1
+    WATCHES.append({
+        "id": wid, "chat_id": chat_id,
+        "metric": metric, "column": _WATCH_METRICS[metric],
+        "op": op, "value": value,
+        "created_ts": time.time(),
+    })
+    send_message(chat_id, f"✅ Watch `#{wid}`: {metric} {op} {value} (one-shot).")
+
+
+def _check_watches() -> None:
+    """Called periodically from poll_loop. Fires one-shot alerts."""
+    if not WATCHES:
+        return
+    last = sm.db_last_metric()
+    if not last:
+        return
+    fired: list[int] = []
+    for w in WATCHES:
+        v = last.get(w["column"])
+        if v is None:
+            continue
+        op = w["op"]
+        hit = (op == ">" and v > w["value"]) or (op == "<" and v < w["value"]) \
+            or (op == ">=" and v >= w["value"]) or (op == "<=" and v <= w["value"])
+        if hit:
+            send_message(w["chat_id"],
+                f"🔔 *Watch #{w['id']} fired*\n"
+                f"{w['metric']} {op} {w['value']}  →  *{v:.2f}*")
+            fired.append(w["id"])
+    if fired:
+        WATCHES[:] = [w for w in WATCHES if w["id"] not in fired]
+
+
+# ---------------------------------------------------------------------------
+# Live dashboard
+# ---------------------------------------------------------------------------
+
+# {chat_id: {"message_id": int, "expires_ts": float, "next_refresh_ts": float}}
+DASHBOARDS: dict[int, dict] = {}
+DASHBOARD_DURATION_SECONDS = 600
+DASHBOARD_REFRESH_SECONDS = 30
+
+
+def cmd_dashboard(chat_id: int, args: str) -> None:
+    if args.strip().lower() in ("off", "stop"):
+        DASHBOARDS.pop(chat_id, None)
+        send_message(chat_id, "Dashboard stopped.")
+        return
+    text, _ = render_status_compact()
+    text = "📡 *Live dashboard (auto-refreshes)*\n\n" + text + \
+           f"\n_Updates every {DASHBOARD_REFRESH_SECONDS}s for {DASHBOARD_DURATION_SECONDS//60} min._"
+    kb = {"inline_keyboard": [[
+        {"text": "⏹ Stop", "callback_data": "dash:stop"},
+        {"text": "🔄 Now", "callback_data": "dash:now"},
+    ]]}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown",
+               "disable_web_page_preview": True, "reply_markup": kb}
+    res = _post("sendMessage", payload)
+    if not res or not res.get("ok"):
+        return
+    mid = res["result"]["message_id"]
+    now = time.time()
+    DASHBOARDS[chat_id] = {
+        "message_id": mid,
+        "expires_ts": now + DASHBOARD_DURATION_SECONDS,
+        "next_refresh_ts": now + DASHBOARD_REFRESH_SECONDS,
+    }
+
+
+def _refresh_dashboards() -> None:
+    now = time.time()
+    expired: list[int] = []
+    for chat_id, d in DASHBOARDS.items():
+        if now >= d["expires_ts"]:
+            expired.append(chat_id)
+            continue
+        if now < d["next_refresh_ts"]:
+            continue
+        try:
+            text, _ = render_status_compact()
+            text = "📡 *Live dashboard*\n\n" + text + \
+                   f"\n_Next refresh in {DASHBOARD_REFRESH_SECONDS}s_"
+            kb = {"inline_keyboard": [[
+                {"text": "⏹ Stop", "callback_data": "dash:stop"},
+                {"text": "🔄 Now", "callback_data": "dash:now"},
+            ]]}
+            edit_message(chat_id, d["message_id"], text, kb)
+        except Exception:
+            logger.exception("dashboard refresh failed for %s", chat_id)
+        d["next_refresh_ts"] = now + DASHBOARD_REFRESH_SECONDS
+    for c in expired:
+        try:
+            send_message(c, "_Dashboard expired. Send /dashboard to start a new one._")
+        finally:
+            DASHBOARDS.pop(c, None)
+
+
+# ---------------------------------------------------------------------------
+# Maintenance commands
+# ---------------------------------------------------------------------------
+
+def cmd_logs(chat_id: int, args: str) -> None:
+    n = 30
+    try:
+        if args.strip():
+            n = max(5, min(200, int(args.strip())))
+    except ValueError:
+        pass
+    paths = [
+        ("monitor.log",      os.path.join(sm.LOG_DIR, "monitor.log")),
+        ("telegram_bot.log", os.path.join(sm.BOT_LOGS_DIR, "telegram_bot.log")),
+    ]
+    out = []
+    for label, p in paths:
+        if not os.path.exists(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-n:]
+            out.append(f"*{label}* (last {len(tail)} lines)")
+            out.append(code_block("".join(tail)[-3500:]))
+        except OSError as e:
+            out.append(f"_{label}: {e}_")
+    send_message(chat_id, "\n".join(out) if out else "_No log files found._")
+
+
+def cmd_restart(chat_id: int, _args: str) -> None:
+    send_message(chat_id, "♻️ Restarting bot now. (Service supervisor will bring it back up.)")
+    logger.info("restart requested via telegram by chat %s", chat_id)
+    # Exit cleanly so systemd/Task Scheduler relaunches us.
+    os._exit(0)
+
+
+def cmd_dbbackup(chat_id: int, _args: str) -> None:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(sm.LOG_DIR, f"sysmon_backup_{stamp}.db")
+    import sqlite3
+    src = sqlite3.connect(sm.DB_PATH)
+    dst = sqlite3.connect(dest)
+    try:
+        with dst:
+            src.backup(dst)
+    finally:
+        src.close(); dst.close()
+    size_mb = os.path.getsize(dest) / (1024 * 1024)
+    send_document(chat_id, dest, caption=f"sysmon backup · {size_mb:.2f} MB")
+    try:
+        os.remove(dest)
+    except OSError:
+        pass
+
+
 def cmd_getlog(chat_id: int, _args: str) -> None:
     sess = get_session(chat_id)
     sess.page = 0
@@ -738,6 +1254,25 @@ COMMANDS: dict[str, Callable[[int, str], None]] = {
     "/threshold": cmd_threshold,
     "/getlog": cmd_getlog,
     "/db": cmd_db,
+    # v2 — operational insight
+    "/dashboard": cmd_dashboard,
+    "/chart": cmd_chart,
+    "/diskio": cmd_diskio,
+    "/listening": cmd_listening,
+    "/conns": cmd_conns,
+    "/connections": cmd_conns,
+    "/failed": cmd_failed,
+    "/journal": cmd_journal,
+    "/updates": cmd_updates,
+    "/health": cmd_health,
+    "/alerts_log": cmd_alerts_log,
+    "/alertslog": cmd_alerts_log,
+    "/watch": cmd_watch,
+    # v2 — maintenance
+    "/logs": cmd_logs,
+    "/restart": cmd_restart,
+    "/dbbackup": cmd_dbbackup,
+    "/db_backup": cmd_dbbackup,
 }
 
 
@@ -795,6 +1330,18 @@ def handle_callback(cb: dict) -> None:
         elif view == "settings":
             text, kb = render_settings()
             edit_message(chat_id, message_id, text, kb)
+        return
+
+    if data == "dash:stop":
+        d = DASHBOARDS.pop(chat_id, None)
+        if d:
+            text, _ = render_status_compact()
+            edit_message(chat_id, d["message_id"], "📡 *Dashboard stopped*\n\n" + text)
+        return
+
+    if data == "dash:now":
+        if chat_id in DASHBOARDS:
+            DASHBOARDS[chat_id]["next_refresh_ts"] = 0  # force refresh next loop tick
         return
 
     if data.startswith("sum:"):
@@ -929,10 +1476,14 @@ def poll_loop() -> None:
     backoff = 1.0
     while True:
         try:
-            params = {"timeout": POLL_TIMEOUT, "allowed_updates": ["message", "callback_query"]}
+            # Use shorter polling when there are active dashboards or watches
+            # so we can refresh / check them on time.
+            active = bool(DASHBOARDS or WATCHES)
+            poll = 10 if active else POLL_TIMEOUT
+            params = {"timeout": poll, "allowed_updates": ["message", "callback_query"]}
             if offset is not None:
                 params["offset"] = offset
-            r = SESSION.get(f"{API_URL}/getUpdates", params=params, timeout=POLL_TIMEOUT + 10)
+            r = SESSION.get(f"{API_URL}/getUpdates", params=params, timeout=poll + 10)
             if r.status_code != 200:
                 logger.warning("getUpdates %s: %s", r.status_code, r.text[:200])
                 time.sleep(min(backoff, 30))
@@ -951,6 +1502,13 @@ def poll_loop() -> None:
                     logger.exception("update handler crashed")
             if data.get("result"):
                 _save_offset(offset)  # persist only on progress
+
+            # Background housekeeping after each getUpdates cycle
+            try:
+                _refresh_dashboards()
+                _check_watches()
+            except Exception:
+                logger.exception("housekeeping crashed")
         except requests.exceptions.Timeout:
             continue
         except requests.exceptions.RequestException as e:
