@@ -33,6 +33,8 @@ from typing import Any, Iterable, Iterator
 import psutil
 
 
+__version__ = "1.0.0"
+
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = os.name == "posix" and platform.system() == "Linux"
 
@@ -544,6 +546,41 @@ def db_connect(readonly: bool = False) -> Iterator[sqlite3.Connection]:
             pass
 
 
+def _get_db_version(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
+    try:
+        return int(row["value"]) if row else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+# Schema migrations keyed by target version. Each function receives an open
+# connection and is responsible for the upgrade FROM the previous version.
+# Add new entries here in future releases; do not edit historical ones.
+_MIGRATIONS: dict[int, "callable"] = {
+    # 1: initial schema — handled by DB_SCHEMA itself
+}
+
+
+def _run_migrations(conn: sqlite3.Connection) -> int:
+    current = _get_db_version(conn)
+    target = DB_SCHEMA_VERSION
+    if current >= target:
+        return 0
+    applied = 0
+    for v in range(current + 1, target + 1):
+        fn = _MIGRATIONS.get(v)
+        if fn is not None:
+            logging.getLogger("sysmon").info("Applying DB migration -> v%d", v)
+            fn(conn)
+            applied += 1
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
+            (str(v),),
+        )
+    return applied
+
+
 def db_init(auto_migrate: bool = True) -> None:
     """Create schema if missing. Idempotent. Called automatically on first use."""
     global _db_initialized
@@ -553,11 +590,8 @@ def db_init(auto_migrate: bool = True) -> None:
         os.makedirs(LOG_DIR, exist_ok=True)
         with db_connect() as conn:
             conn.executescript(DB_SCHEMA)
+            _run_migrations(conn)
             conn.execute(
-                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
-                (str(DB_SCHEMA_VERSION),),
-            )
-            row = conn.execute(
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('migrated_from_csv', '0')"
             )
             migrated = conn.execute(
