@@ -1,172 +1,157 @@
-# **System Monitoring Script**
+# sys_monitoring
 
-This script monitors system metrics such as CPU load, temperature, RAM usage, disk usage, network activity, and estimates power consumption for a Linux-based system (e.g., Raspberry Pi). It logs the data in a CSV file, archives logs daily, and sends Telegram alerts when thresholds are exceeded.
+Lightweight Linux/Windows system monitor with a SQLite-backed time-series
+store and an interactive Telegram bot. Managed through a single CLI
+(`sysmon`) so setup, updates, and day-to-day maintenance are all one-liners.
 
----
+- Cron-driven (Linux) or Task Scheduler-driven (Windows) collector writes
+  one row per minute into `logs/sysmon.db` (SQLite WAL).
+- Edge-triggered Telegram alerts: notify on threshold crossing, again only
+  after a cooldown, and once on recovery.
+- Bot exposes live system insight via inline keyboards: status, top procs,
+  disks, network, summaries, service status, day-by-day log export.
+- Runtime tuning over Telegram: `/threshold`, `/alerts on|off`.
 
-## **Features**
+## Quick start
 
-- **Metrics Monitored**:
-  - CPU Load
-  - System Temperature
-  - RAM and Disk Usage
-  - Network Sent/Received Data
-  - Estimated Power Consumption (Watt-Hours)
-
-- **Log Management**:
-  - Logs system data to a CSV file (`power_log.csv`).
-  - Archives logs daily into folders with the format `logs/log_archive/YYYY/Mon_MM/`.
-
-- **Alerts**:
-  - Sends Telegram notifications when metrics exceed configured thresholds.
-
-- **Power Estimation**:
-  - Calculates power consumed since the last execution and logs it as Watt-Hours (Wh).
-
----
-
-## **Installation**
-
-### **1. Clone the Repository**
+### Linux / macOS
 
 ```bash
-git clone https://github.com/Jonatan-Gani/sys_monitoring.git
+git clone -b claude/improve-telegram-bot-cYtjX \
+    https://github.com/Jonatan-Gani/sys_monitoring.git
 cd sys_monitoring
+./install.sh
 ```
 
-### **2. Install Dependencies**
+### Windows (elevated PowerShell)
 
-This script uses `psutil` and `requests`:
-
-```bash
-sudo apt update
-sudo apt install python3-psutil python3-requests
+```powershell
+git clone -b claude/improve-telegram-bot-cYtjX `
+    https://github.com/Jonatan-Gani/sys_monitoring.git
+cd sys_monitoring
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-### **3. Create a `.env` File**
+Both scripts:
 
-Add your Telegram Bot Token and Chat ID to a `.env` file:
+1. Verify Python ≥ 3.10 and pip,
+2. Create a `.venv/` and install the package in editable mode (so the
+   `sysmon` command is on PATH),
+3. Launch `sysmon init` — an interactive wizard that validates your
+   Telegram credentials live, writes `.env`, initializes the database,
+   sends a test message, and offers to install the OS service.
 
-```bash
-nano .env
-```
-Add the following content:
+After install, every command below works from the project directory (or
+from anywhere if the venv is active).
 
-```
-BOT_TOKEN=your_telegram_bot_token
-CHAT_ID=your_telegram_chat_id
-```
-
-### **4. Configure Thresholds**
-
-Edit the `config.json` file to set threshold values:
-
-```json
-{
-  "bot_token": "${BOT_TOKEN}",
-  "chat_id": "${CHAT_ID}",
-  "thresholds": {
-    "cpu_load": 90.0,
-    "temperature": 70.0,
-    "power": 10.0,
-    "ram_usage": 85.0,
-    "disk_usage": 90.0
-  }
-}
-```
-
-### **5. Schedule the Script**
-
-Use `cron` to run the script every minute:
-
-```bash
-crontab -e
-```
-Add the following line:
+## The CLI
 
 ```
-* * * * * /usr/bin/python3 /path/to/log_pi_status.py
+sysmon init                          interactive first-time setup
+sysmon doctor                        run all health checks
+sysmon update                        git pull + reinstall deps + migrate + restart
+sysmon version                       print version info
+
+sysmon logger run                    run one logger pass (what cron does)
+sysmon bot run                       run the Telegram bot in the foreground
+
+sysmon service install [--system]    install systemd units / Windows tasks
+sysmon service uninstall [--system]  remove them
+sysmon service start|stop|status     control the service
+
+sysmon config list                   print full config
+sysmon config get  <dotted.key>      e.g. thresholds.cpu_load
+sysmon config set  <dotted.key> <v>  e.g. alerts.cooldown_minutes 15
+
+sysmon db stats                      row count, size, time range
+sysmon db backup                     online backup -> logs/sysmon_backup_*.db
+sysmon db prune <days>               delete rows older than N days
+sysmon db import-csv                 re-run the one-shot legacy CSV import
+
+sysmon test telegram                 send a test message
 ```
 
----
-
-## **Logs**
-
-- **Current Logs**:
-  - `logs/power_log.csv`: Stores current system metrics.
-- **Archived Logs**:
-  - Logs are archived daily into the `logs/log_archive/YYYY/Mon_MM/` directory.
-
----
-
-## **Usage**
-
-Run the script manually:
-
-```bash
-python3 log_pi_status.py
-```
-
-To automate, ensure `cron` is running and scheduled as mentioned above.
-
----
-
-## **Example Output (CSV)**
+`sysmon doctor` exits non-zero if any check fails — wire it into your own
+monitoring or run it after `sysmon update`. Sample output:
 
 ```
-Timestamp,CPU Load (%),Temperature (°C),RAM Usage (%),Disk Usage (%),Network Sent (MB),Network Received (MB),Estimated Power (W),Interval Wh
-2024-12-17 20:07:41,34.50,47.40,8.10,83.20,26425.18,17263.80,4.50,0.0750
-2024-12-17 20:08:41,38.10,48.20,9.30,84.10,26427.18,17265.80,5.20,0.0800
+✓ Python               Python 3.12.1
+✓ Dependencies         deps: psutil 7.0.0, requests 2.32.3
+✓ Environment          .env present with BOT_TOKEN and CHAT_ID
+✓ Telegram API         bot @MyMonitorBot; chat 12345 reachable
+✓ Database             DB 14,873 rows, 1.83 MB
+✓ Logger freshness     latest row 22s old
+✓ Disk space           30.0 GB free in repo dir
+✓ Service              bot:active, logger:waiting
 ```
 
----
-
-## **Alerts**
-
-The script sends alerts to the specified Telegram chat when thresholds are exceeded:
-
-- **High CPU Load**: ⚠️ High CPU Load: 90.0%
-- **High Temperature**: 🔥 High Temperature: 70.0°C
-- **High Power Consumption**: ⚡ High Power Consumption: 10.0 W
-- **High RAM or Disk Usage**: ⚠️ High RAM Usage: 85.0%
-
----
-
-## **How to Get Telegram Bot Token and Chat ID**
-
-### **1. Create a Telegram Bot**
-
-1. Open Telegram and search for "BotFather".
-2. Start a chat with BotFather and type `/newbot`.
-3. Follow the instructions to set a name and username for your bot.
-4. After creation, you will receive the bot token. KEEP BOT TOKEN PRIVATE AND NEVER SHARE IT!
-
-### **2. Get Your Chat ID**
-
-1. Start a chat with your newly created bot.
-2. Open a browser and go to the following URL, replacing `<BOT_TOKEN>` with your bot's token:
-   ```
-   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
-   ```
-3. Send a message to your bot (e.g., "Hello").
-4. Refresh the URL, and look for the `chat` field in the response JSON. Note down the `id` as your `CHAT_ID`.
-
----
-
-## **Directory Structure**
+## Updating
 
 ```
-sys_monitoring/
-│
-├── log_pi_status.py         # Main script
-├── config.json              # Configuration file
-├── .env                     # Environment variables (Telegram API)
-├── logs/
-│   ├── power_log.csv        # Current CSV log
-│   └── log_archive/         # Archived logs
-│       ├── YYYY/
-│       │   └── Mon_MM/
-│       │       └── 17_Tuesday.csv
-└── README.md                # Project README file
+sysmon update
 ```
 
+`git pull --ff-only` on the current branch, `pip install -r requirements.txt`,
+runs DB migrations (versioned via `schema_meta`), then restarts the bot
+service if one is installed. No manual steps.
+
+## Telegram bot commands
+
+Compact-by-default — every screen has inline buttons to drill in.
+
+| Command | What it shows |
+|---|---|
+| `/start`, `/menu`, `/status` | One-screen snapshot with action buttons |
+| `/cpu` `/ram` `/disk` `/disks` `/temp` `/net` `/uptime` | Targeted live readings |
+| `/top [cpu\|mem]` | Top processes (toggleable) |
+| `/service <unit>` | systemd/Windows-service status |
+| `/summary [hours]` | Min/avg/max + energy + net (SQL-aggregated, default 24h) |
+| `/latest` | Today's metrics as CSV |
+| `/export YYYY-MM-DD` | Export a specific day as CSV |
+| `/getlog` | Browse stored days by year → month → day |
+| `/db` | Database stats |
+| `/alerts on\|off\|status` | Runtime alert toggle |
+| `/threshold <name> <value>` | Tune a threshold without editing config |
+| `/help` | Command reference |
+
+Status icons: 🟢 below 85% of threshold, 🟡 85–100%, 🔴 over threshold.
+
+## Files
+
+| File | Role |
+|------|------|
+| `sysmon.py` | The management CLI. |
+| `sysmon_lib.py` | Core library: SQLite layer, config, metrics, formatters. |
+| `log_pi_status.py` | Cron / scheduled-task entry point. Inserts one DB row. |
+| `tg_bot_loop.py` | Telegram bot main loop. |
+| `install.sh` / `install.ps1` | Bootstrap (venv + deps + `sysmon init`). |
+| `pyproject.toml` | Makes `sysmon` an installed CLI via `pip install -e .`. |
+| `config.json` | Thresholds, alert policy, power model, retention, bot tuning. |
+| `.env` | `BOT_TOKEN`, `CHAT_ID`, `AUTHORIZED_USERS`. Auto-chmod 600 on POSIX. |
+
+## Storage
+
+`logs/sysmon.db` (SQLite, WAL mode). Schema:
+
+```sql
+metrics       (ts PK, cpu_load, temperature, ram_usage, disk_usage,
+               net_*_total_mb, net_*_delta_mb, load_avg_1m, power_w, interval_wh)
+alert_events  (id, ts, metric, event['breach'|'recovery'|'continued'], value, threshold)
+schema_meta   (key, value)              -- includes the current schema version
+```
+
+WAL mode + autocommit + `busy_timeout=5000` mean the bot reads freely while
+the cron job writes. ~50 MB/year at one row/minute. Retention enforced by
+`storage.retention_days` (default 365; `0` = forever) once per local day.
+
+## Platform notes
+
+| Concern | Linux | Windows |
+|---|---|---|
+| Scheduling | systemd timer (preferred) or cron | Task Scheduler |
+| Bot persistence | systemd service | Task Scheduler (ONLOGON) or NSSM |
+| Temperature | `/sys/class/thermal` or psutil sensors | usually `n/a` (no standard API) |
+| `/service` | `systemctl show ...` | `psutil.win_service_get(...)` |
+
+Both paths are handled inside `sysmon_lib`; the bot itself has no
+platform-specific code.

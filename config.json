@@ -1,12 +1,29 @@
 {
-  "bot_token": "${BOT_TOKEN}",
-  "chat_id": "${CHAT_ID}",
-  "debug": true,
+  "alerts": {
+    "cooldown_minutes": 30,
+    "enabled": true,
+    "send_recovery": true
+  },
+  "bot": {
+    "items_per_page": 6,
+    "poll_timeout": 30,
+    "session_timeout_seconds": 120,
+    "show_processes": 5
+  },
+  "debug": false,
+  "power_model": {
+    "idle_watts": 4.5,
+    "load_watts": 7.5
+  },
+  "storage": {
+    "auto_migrate_csv": true,
+    "retention_days": 365
+  },
   "thresholds": {
-    "cpu_load": 90.0,
-    "temperature": 70.0,
+    "cpu_load": 90,
+    "disk_usage": 90.0,
     "power": 10.0,
     "ram_usage": 85.0,
-    "disk_usage": 90.0
+    "temperature": 70.0
   }
 }
