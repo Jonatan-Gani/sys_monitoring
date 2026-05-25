@@ -1,16 +1,32 @@
-# Ignore config.json
+# Secrets / per-host config
+.env
 config.json
 
-# Ignore Python cache files
+# Python caches
 __pycache__/
 *.pyc
+*.pyo
 
-# Ignore log files
-*.log
+# Virtual environments (created by install.sh / install.ps1)
+.venv/
+venv/
+
+# Build artifacts / installed-package metadata
+*.egg-info/
+build/
+dist/
+
+# Runtime data — the entire logs/ tree:
+#   logs/sysmon.db (+ .db-wal, .db-shm), logs/monitor.log,
+#   logs/bot_logs/*, logs/state/*, logs/log_archive/**
+logs/
+
+# Legacy CSV paths (kept for safety in case someone runs the old script)
 log_archive/
 power_log.txt
 power_log.csv
 
-# Ignore system files
+# OS / editor
 .DS_Store
-.env
+Thumbs.db
+.idea/workspace.xml
