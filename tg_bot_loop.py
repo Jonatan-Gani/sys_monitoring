@@ -248,19 +248,21 @@ def render_status_compact() -> tuple[str, dict]:
             worst = "🟡"
     health_label = {"🟢": "healthy", "🟡": "watch", "🔴": "critical"}[worst]
 
-    # Column layout inside the code block:
-    #   label (left, 5 wide) + 2 spaces + value (right, 6 wide) + 2 spaces + extra
-    # Sparklines always start at column 15.
+    # Strict left-aligned grid: every column begins at the same character
+    # position across all rows.
+    #
+    #   col 0-5   label  (6 chars, left)
+    #   col 6-13  value  (8 chars, left, includes its own unit)
+    #   col 14+   extra / sparkline
     def L(label: str, value: str, extra: str = "") -> str:
-        return f"{label:<5}  {value:>6}  {extra}".rstrip()
+        return f"{label:<6}{value:<8}{extra}".rstrip()
 
     temp_value = f"{m.temperature:.1f}°C" if m.temperature is not None else "n/a"
     temp_extra = spark("temperature") if m.temperature is not None else ""
 
     rows = [
         L("CPU",   f"{m.cpu_load:.1f}%",         spark("cpu_load")),
-        # Load gets its own format — three numbers don't fit the value column
-        f"Load   {m.load_avg_1m:5.2f} {m.load_avg_5m:5.2f} {m.load_avg_15m:5.2f}   (1m 5m 15m)",
+        L("Load",  f"{m.load_avg_1m:.2f}",       f"{m.load_avg_5m:.2f}  {m.load_avg_15m:.2f}  (1m 5m 15m)"),
         L("Temp",  temp_value,                   temp_extra),
         L("RAM",   f"{m.ram_usage:.1f}%",        spark("ram_usage")),
         L("Disk",  f"{m.disk_usage:.1f}%",       "(mounted /)"),
