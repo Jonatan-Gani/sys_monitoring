@@ -126,12 +126,35 @@ def send_document(chat_id: int | str, file_path: str, caption: str | None = None
         send_message(chat_id, f"_Failed to send file: {e}_")
 
 
-def is_authorized(user_id: int | str) -> bool:
-    """Whitelist check. Logs every miss so you can spot probing in the bot log."""
-    ok = str(user_id) in AUTHORIZED_USERS
-    if not ok:
-        logger.warning("Unauthorized access attempt by Telegram user_id=%s", user_id)
-    return ok
+# Per-user_id cooldown so a probing bot can't blow up our log file
+# (or our disk I/O) by hammering the API. First attempt is always logged;
+# subsequent attempts from the same user_id within the cooldown are silent.
+_UNAUTHORIZED_LOG_COOLDOWN = 600  # seconds
+_UNAUTHORIZED_LOG_MAX = 1000      # cap the dict
+_unauthorized_log: dict[int, float] = {}
+
+
+def is_authorized(user_id: int | str, from_obj: dict | None = None) -> bool:
+    """Whitelist check with rate-limited logging for misses."""
+    if str(user_id) in AUTHORIZED_USERS:
+        return True
+
+    now = time.time()
+    uid_int = int(user_id) if str(user_id).lstrip("-").isdigit() else 0
+    last = _unauthorized_log.get(uid_int, 0)
+    if now - last >= _UNAUTHORIZED_LOG_COOLDOWN:
+        username = (from_obj or {}).get("username")
+        first = (from_obj or {}).get("first_name")
+        ident = f"@{username}" if username else (first or "?")
+        logger.warning("Unauthorized Telegram access user_id=%s (%s)", user_id, ident)
+        _unauthorized_log[uid_int] = now
+
+        # Opportunistic trim so the dict can't grow forever.
+        if len(_unauthorized_log) > _UNAUTHORIZED_LOG_MAX:
+            cutoff = now - 3600
+            for k in [k for k, v in _unauthorized_log.items() if v < cutoff]:
+                _unauthorized_log.pop(k, None)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +213,12 @@ def _emoji_for(metric: str, value: float) -> str:
 
 
 def render_status_compact() -> tuple[str, dict]:
-    """One-screen summary of current system state with hour-long sparklines."""
+    """One-screen summary of current system state with hour-long sparklines.
+
+    Layout strategy: a single fenced code block so columns align in Telegram's
+    monospace renderer. Status emojis at the start of each line are tolerated
+    (their width can vary across clients, but they're consistent within a row).
+    """
     m = sm.collect_metrics(CONFIG.get("power_model", {}), blocking=False)
     info = sm.system_info()
 
@@ -199,25 +227,28 @@ def render_status_compact() -> tuple[str, dict]:
             vals = sm.db_recent_values(col, hours=1.0)
         except Exception:
             return ""
-        s = sm.sparkline(vals, width=20)
-        return f" `{s}`" if s else ""
+        return sm.sparkline(vals, width=20) or ""
 
-    temp_str = f"{m.temperature:.1f}°C" if m.temperature is not None else "n/a"
-    temp_emoji = _emoji_for("temperature", m.temperature) if m.temperature is not None else "🟢"
+    temp_em = _emoji_for("temperature", m.temperature) if m.temperature is not None else "🟢"
+    temp_value = f"{m.temperature:5.1f}°C" if m.temperature is not None else "   n/a"
+    temp_spark = spark("temperature") if m.temperature is not None else ""
 
-    lines = [
-        f"*{info.get('hostname','host')}* · up {sm.format_uptime(m.uptime_seconds)}",
-        "",
-        f"{_emoji_for('cpu_load', m.cpu_load)} CPU `{m.cpu_load:5.1f}%`{spark('cpu_load')}",
-        f"        load `{m.load_avg_1m:.2f} {m.load_avg_5m:.2f} {m.load_avg_15m:.2f}`",
-        f"{temp_emoji} Temp `{temp_str}`{spark('temperature') if m.temperature is not None else ''}",
-        f"{_emoji_for('ram_usage', m.ram_usage)} RAM `{m.ram_usage:5.1f}%`{spark('ram_usage')}",
-        f"{_emoji_for('disk_usage', m.disk_usage)} Disk `{m.disk_usage:5.1f}%` (/)",
-        f"💽 I/O  `↑{m.disk_write_mb_s:5.1f}` `↓{m.disk_read_mb_s:5.1f} MB/s`",
-        f"⚙️  Procs `{m.procs_total}` ({m.procs_running} running)",
-        f"⚡ Power `{m.power_estimation:.2f} W`",
+    # Each row: [emoji] [label 6] [value 8] [sparkline / suffix]
+    rows = [
+        f"{_emoji_for('cpu_load', m.cpu_load)} CPU    {m.cpu_load:5.1f}%   {spark('cpu_load')}",
+        f"   load   {m.load_avg_1m:5.2f} {m.load_avg_5m:5.2f} {m.load_avg_15m:5.2f}   (1m 5m 15m)",
+        f"{temp_em} Temp  {temp_value}   {temp_spark}",
+        f"{_emoji_for('ram_usage', m.ram_usage)} RAM    {m.ram_usage:5.1f}%   {spark('ram_usage')}",
+        f"{_emoji_for('disk_usage', m.disk_usage)} Disk   {m.disk_usage:5.1f}%   (/)",
+        f"💽 I/O   {m.disk_write_mb_s:5.1f}↑ {m.disk_read_mb_s:5.1f}↓ MB/s",
+        f"⚙  Procs {m.procs_total:>4}     ({m.procs_running} running)",
+        f"⚡ Power  {m.power_estimation:5.2f} W",
     ]
-    text = "\n".join(lines)
+    body = "```\n" + "\n".join(rows) + "\n```"
+    text = (
+        f"*{info.get('hostname','host')}*  ·  up {sm.format_uptime(m.uptime_seconds)}\n"
+        + body
+    )
 
     keyboard = {
         "inline_keyboard": [
@@ -1288,9 +1319,9 @@ def handle_callback(cb: dict) -> None:
     data = cb.get("data", "")
     cb_id = cb["id"]
 
-    if not is_authorized(user_id):
-        # Silently ack so the spinner stops, but don't tell them anything.
-        answer_callback(cb_id)
+    if not is_authorized(user_id, cb.get("from")):
+        # Don't call answerCallbackQuery — saves an API request. The user's
+        # spinner just times out client-side; no signal that the bot exists.
         return
 
     sess = get_session(chat_id)
@@ -1428,8 +1459,8 @@ def handle_message(msg: dict) -> None:
     user_id = msg["from"]["id"]
     text = msg.get("text", "")
 
-    if not is_authorized(user_id):
-        # Silent drop — don't reveal the bot exists. Attempt is logged above.
+    if not is_authorized(user_id, msg.get("from")):
+        # Silent drop — don't reveal the bot exists. Attempt is rate-limit logged.
         return
 
     if not text:
