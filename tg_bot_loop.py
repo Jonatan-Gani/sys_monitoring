@@ -215,9 +215,10 @@ def _emoji_for(metric: str, value: float) -> str:
 def render_status_compact() -> tuple[str, dict]:
     """One-screen summary of current system state with hour-long sparklines.
 
-    Layout strategy: a single fenced code block so columns align in Telegram's
-    monospace renderer. Status emojis at the start of each line are tolerated
-    (their width can vary across clients, but they're consistent within a row).
+    Layout: header line (bold + overall status emoji) outside a fenced code
+    block. Everything inside the block is plain ASCII so columns align
+    reliably across all Telegram clients (per-row emojis cause uneven width
+    in some monospace fonts).
     """
     m = sm.collect_metrics(CONFIG.get("power_model", {}), blocking=False)
     info = sm.system_info()
@@ -229,24 +230,49 @@ def render_status_compact() -> tuple[str, dict]:
             return ""
         return sm.sparkline(vals, width=20) or ""
 
-    temp_em = _emoji_for("temperature", m.temperature) if m.temperature is not None else "🟢"
-    temp_value = f"{m.temperature:5.1f}°C" if m.temperature is not None else "   n/a"
-    temp_spark = spark("temperature") if m.temperature is not None else ""
+    # Worst-of overall status for the header
+    status_inputs = [
+        ("cpu_load", m.cpu_load),
+        ("ram_usage", m.ram_usage),
+        ("disk_usage", m.disk_usage),
+    ]
+    if m.temperature is not None:
+        status_inputs.append(("temperature", m.temperature))
+    worst = "🟢"
+    for key, val in status_inputs:
+        e = _emoji_for(key, val)
+        if e == "🔴":
+            worst = "🔴"
+            break
+        if e == "🟡" and worst != "🔴":
+            worst = "🟡"
+    health_label = {"🟢": "healthy", "🟡": "watch", "🔴": "critical"}[worst]
 
-    # Each row: [emoji] [label 6] [value 8] [sparkline / suffix]
+    # Column layout inside the code block:
+    #   label (left, 5 wide) + 2 spaces + value (right, 6 wide) + 2 spaces + extra
+    # Sparklines always start at column 15.
+    def L(label: str, value: str, extra: str = "") -> str:
+        return f"{label:<5}  {value:>6}  {extra}".rstrip()
+
+    temp_value = f"{m.temperature:.1f}°C" if m.temperature is not None else "n/a"
+    temp_extra = spark("temperature") if m.temperature is not None else ""
+
     rows = [
-        f"{_emoji_for('cpu_load', m.cpu_load)} CPU    {m.cpu_load:5.1f}%   {spark('cpu_load')}",
-        f"   load   {m.load_avg_1m:5.2f} {m.load_avg_5m:5.2f} {m.load_avg_15m:5.2f}   (1m 5m 15m)",
-        f"{temp_em} Temp  {temp_value}   {temp_spark}",
-        f"{_emoji_for('ram_usage', m.ram_usage)} RAM    {m.ram_usage:5.1f}%   {spark('ram_usage')}",
-        f"{_emoji_for('disk_usage', m.disk_usage)} Disk   {m.disk_usage:5.1f}%   (/)",
-        f"💽 I/O   {m.disk_write_mb_s:5.1f}↑ {m.disk_read_mb_s:5.1f}↓ MB/s",
-        f"⚙  Procs {m.procs_total:>4}     ({m.procs_running} running)",
-        f"⚡ Power  {m.power_estimation:5.2f} W",
+        L("CPU",   f"{m.cpu_load:.1f}%",         spark("cpu_load")),
+        # Load gets its own format — three numbers don't fit the value column
+        f"Load   {m.load_avg_1m:5.2f} {m.load_avg_5m:5.2f} {m.load_avg_15m:5.2f}   (1m 5m 15m)",
+        L("Temp",  temp_value,                   temp_extra),
+        L("RAM",   f"{m.ram_usage:.1f}%",        spark("ram_usage")),
+        L("Disk",  f"{m.disk_usage:.1f}%",       "(mounted /)"),
+        L("I/O",   f"{m.disk_write_mb_s:.1f}↑",  f"{m.disk_read_mb_s:.1f}↓ MB/s"),
+        L("Procs", f"{m.procs_total}",           f"({m.procs_running} running)"),
+        L("Power", f"{m.power_estimation:.2f} W"),
     ]
     body = "```\n" + "\n".join(rows) + "\n```"
     text = (
-        f"*{info.get('hostname','host')}*  ·  up {sm.format_uptime(m.uptime_seconds)}\n"
+        f"*{info.get('hostname','host')}*  ·  "
+        f"up {sm.format_uptime(m.uptime_seconds)}  ·  "
+        f"{worst} {health_label}\n"
         + body
     )
 
