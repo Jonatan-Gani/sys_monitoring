@@ -127,9 +127,10 @@ def send_document(chat_id: int | str, file_path: str, caption: str | None = None
 
 
 def is_authorized(user_id: int | str) -> bool:
+    """Whitelist check. Logs every miss so you can spot probing in the bot log."""
     ok = str(user_id) in AUTHORIZED_USERS
     if not ok:
-        logger.warning("Unauthorized access by user %s", user_id)
+        logger.warning("Unauthorized access attempt by Telegram user_id=%s", user_id)
     return ok
 
 
@@ -1288,7 +1289,8 @@ def handle_callback(cb: dict) -> None:
     cb_id = cb["id"]
 
     if not is_authorized(user_id):
-        answer_callback(cb_id, "Unauthorized.", alert=True)
+        # Silently ack so the spinner stops, but don't tell them anything.
+        answer_callback(cb_id)
         return
 
     sess = get_session(chat_id)
@@ -1427,7 +1429,7 @@ def handle_message(msg: dict) -> None:
     text = msg.get("text", "")
 
     if not is_authorized(user_id):
-        send_message(chat_id, "Unauthorized.")
+        # Silent drop — don't reveal the bot exists. Attempt is logged above.
         return
 
     if not text:

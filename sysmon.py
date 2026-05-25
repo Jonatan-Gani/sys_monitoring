@@ -79,7 +79,11 @@ def confirm(prompt: str, default: bool = True) -> bool:
 
 
 def prompt(label: str, default: str | None = None, secret: bool = False) -> str:
-    suffix = f" [{default}]" if default else ""
+    """Prompt with optional default. Empty input (Enter) accepts the default."""
+    if default is not None:
+        suffix = f" [{default}] (Enter to keep)"
+    else:
+        suffix = ""
     label_full = f"{label}{suffix}: "
     while True:
         if secret:
@@ -94,6 +98,21 @@ def prompt(label: str, default: str | None = None, secret: bool = False) -> str:
             return value
         if default is not None:
             return default
+
+
+def prompt_user_ids(label: str, default: str | None = None) -> str:
+    """Prompt for a comma-separated list of Telegram numeric user IDs.
+
+    Loops until the input is either empty (accept default) or parses cleanly,
+    so a one-char typo like 'y' can't quietly disable the whitelist.
+    """
+    while True:
+        raw = prompt(label, default=default)
+        ids = [s.strip() for s in raw.split(",") if s.strip()]
+        if all(s.isdigit() for s in ids) and ids:
+            return ",".join(ids)
+        err(f"'{raw}' doesn't look like a comma-separated list of Telegram numeric IDs.")
+        warn("Press Enter on its own line to keep the default. Try again.")
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +527,10 @@ def cmd_init(args) -> int:
         chat_id = prompt("CHAT_ID", default=env.get("CHAT_ID"))
 
     authorized = env.get("AUTHORIZED_USERS") or chat_id
-    authorized = prompt("AUTHORIZED_USERS (comma-separated)", default=authorized)
+    authorized = prompt_user_ids(
+        "AUTHORIZED_USERS (Telegram numeric IDs, comma-separated)",
+        default=authorized,
+    )
 
     env_text = textwrap.dedent(f"""\
         BOT_TOKEN={token}
